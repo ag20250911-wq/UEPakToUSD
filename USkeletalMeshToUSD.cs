@@ -60,7 +60,7 @@ public static class USkeletalMeshToUSD
     /// <summary>
     /// 分割してUSDを出力するメイン（Geo, Skeleton, Root の3ファイルを作る）
     /// </summary>
-    public static void ConvertToSplitUsd(USkeletalMesh skeletalMesh, string outputDirectory)
+    public static void ConvertToSplitUsd(USkeletalMesh skeletalMesh, string outputDirectory, bool optimizeBones = true)
     {
         if (skeletalMesh == null) throw new ArgumentNullException(nameof(skeletalMesh));
         if (string.IsNullOrEmpty(outputDirectory)) throw new ArgumentNullException(nameof(outputDirectory));
@@ -85,6 +85,9 @@ public static class USkeletalMeshToUSD
         var sourceBoneInfo = skeletalMesh.ReferenceSkeleton.FinalRefBoneInfo;
         var sourceBoneIndexMap = skeletalMesh.ReferenceSkeleton.FinalNameToIndexMap;
 
+        // 最適化されたボーンリストを作成（optimizeBonesがtrueの場合）
+        List<int> usedBoneIndices = GetUsedBoneIndices(lodModel.Sections, sourceBoneInfo, optimizeBones);
+
         // 頂点/法線・スキニングデータを作成（メモリ表現）
         ProcessVerticesAndNormals(sourceVertices, out VtVec3fArray usdVertices, out VtVec3fArray usdNormals);
 
@@ -94,19 +97,53 @@ public static class USkeletalMeshToUSD
             maxElementSize = Math.Max(maxElementSize, (uint)section.MaxBoneInfluences);
         }
         uint elementSize = maxElementSize;
-        ProcessSkinningData(sourceVertices, lodModel.Sections, out VtFloatArray usdBoneWeights, out VtIntArray usdBoneIndices, elementSize);
+        ProcessSkinningData(sourceVertices, lodModel.Sections, out VtFloatArray usdBoneWeights, out VtIntArray usdBoneIndices, elementSize, usedBoneIndices, optimizeBones);
 
-        var usdBones = BuildUsdBonePaths(sourceBoneInfo, sourceBoneIndexMap);
+        var usdBones = BuildUsdBonePaths(sourceBoneInfo, usedBoneIndices);
 
         // 1) Geo ファイル作成（ジオメトリ + スキン属性を含める。ただし Skeleton 参照はここでは付けない）
         WriteGeoUsd(geoFile, sanitizedPrimName, originalAssetName, usdVertices, usdNormals, sourceIndices, usdBoneWeights, usdBoneIndices, usdBones, elementSize, skeletalMesh);
 
         // 2) Skeleton ファイル作成（スケルトン / ジョイントXform）
-        WriteSkeletonUsd(skeletonFile, sanitizedPrimName, skeletalMesh, sourceBoneInfo, usdBones);
+        WriteSkeletonUsd(skeletonFile, sanitizedPrimName, skeletalMesh, sourceBoneInfo, usdBones, usedBoneIndices);
 
         // 3) Root ファイル作成（UsdSkelRoot を作り、geo/skeleton を reference で取り込む。さらに mesh -> skeleton の binding を作る）
         WriteRootUsd(rootFile, sanitizedPrimName, geoFile, skeletonFile);
 
+    }
+
+    // 使用されているボーンインデックスを取得（ウェイトがあるボーンとその親をルートまで）
+    private static List<int> GetUsedBoneIndices(FSkelMeshSection[] sections, FMeshBoneInfo[] boneInfo, bool optimizeBones)
+    {
+        if (!optimizeBones)
+        {
+            // 全てのボーンを使用
+            return Enumerable.Range(0, boneInfo.Length).ToList();
+        }
+
+        var usedBones = new HashSet<int>();
+
+        // 各セクションのBoneMapから使用ボーンを集める
+        foreach (var section in sections)
+        {
+            var boneMap = section.BoneMap;
+            foreach (var localBoneIndex in boneMap)
+            {
+                int globalBoneIndex = localBoneIndex;
+                // ウェイトがあるボーンを追加
+                usedBones.Add(globalBoneIndex);
+                // 親をルートまで追加
+                int parentIndex = boneInfo[globalBoneIndex].ParentIndex;
+                while (parentIndex >= 0)
+                {
+                    usedBones.Add(parentIndex);
+                    parentIndex = boneInfo[parentIndex].ParentIndex;
+                }
+            }
+        }
+
+        // ソートしてリスト化（元のインデックス順に）
+        return usedBones.OrderBy(x => x).ToList();
     }
 
     // Geo用USDを書き出す（メッシュとスキンのattrsを持つが、Skeleton参照は持たない）
@@ -241,7 +278,7 @@ public static class USkeletalMeshToUSD
     }
 
     // Skeleton用USDを書き出す（UsdSkelSkeleton とジョイントXform群を出力）
-    private static void WriteSkeletonUsd(string filePath, string primName, USkeletalMesh skeletalMesh, FMeshBoneInfo[] boneInfo, VtTokenArray usdBones)
+    private static void WriteSkeletonUsd(string filePath, string primName, USkeletalMesh skeletalMesh, FMeshBoneInfo[] boneInfo, VtTokenArray usdBones, List<int> usedBoneIndices)
     {
         using (var stage = UsdStage.CreateNew(filePath))
         {
@@ -263,7 +300,7 @@ public static class USkeletalMeshToUSD
             var skeletonPath = skelScope.GetPath().AppendChild(new TfToken(skeletonName));
             var usdSkeleton = UsdSkelSkeleton.Define(stage, skeletonPath);
 
-            int numBones = boneInfo.Length;
+            int numBones = usedBoneIndices.Count;
             var restArray = new VtMatrix4dArray((uint)numBones);
             var bindArray = new VtMatrix4dArray((uint)numBones);
             var jointNames = new VtTokenArray((uint)numBones);
@@ -275,7 +312,8 @@ public static class USkeletalMeshToUSD
 
             for (int i = 0; i < numBones; i++)
             {
-                var item = skeletalMesh.ReferenceSkeleton.FinalRefBonePose[i];
+                int originalIndex = usedBoneIndices[i];
+                var item = skeletalMesh.ReferenceSkeleton.FinalRefBonePose[originalIndex];
                 var uePos = item.Translation * 0.01f;
                 var transformedPos = UsdCoordinateTransformer.TransformPosition(uePos);
                 var ueRot = item.Rotation;
@@ -287,11 +325,11 @@ public static class USkeletalMeshToUSD
                 localMatrices[i] = localM;
 
                 // joint names
-                jointNames[i] = new TfToken(skeletalMesh.ReferenceSkeleton.FinalRefBoneInfo[i].Name.Text);
+                jointNames[i] = new TfToken(skeletalMesh.ReferenceSkeleton.FinalRefBoneInfo[originalIndex].Name.Text);
 
                 // create xform under /SkeletonsXform/<jointPath>
                 var pathBuilder = new StringBuilder();
-                int curr = i;
+                int curr = originalIndex;
                 while (curr >= 0)
                 {
                     pathBuilder.Insert(0, "/" + SanitizeUsdName(skeletalMesh.ReferenceSkeleton.FinalRefBoneInfo[curr].Name.Text));
@@ -310,7 +348,8 @@ public static class USkeletalMeshToUSD
             var xformCacheAPI = new UsdGeomXformCache();
             for (int i = 0; i < numBones; i++)
             {
-                var parentIdx = boneInfo[i].ParentIndex;
+                var originalIndex = usedBoneIndices[i];
+                var parentIdx = boneInfo[originalIndex].ParentIndex;
                 if (parentIdx < 0) worldMatrices[i] = localMatrices[i];
                 else
                 {
@@ -418,10 +457,20 @@ public static class USkeletalMeshToUSD
         }
     }
 
-    private static void ProcessSkinningData(FGPUVertFloat[] sourceVertices, FSkelMeshSection[] sections, out VtFloatArray usdBoneWeights, out VtIntArray usdBoneIndices, uint elementSize)
+    private static void ProcessSkinningData(FGPUVertFloat[] sourceVertices, FSkelMeshSection[] sections, out VtFloatArray usdBoneWeights, out VtIntArray usdBoneIndices, uint elementSize, List<int> usedBoneIndices, bool optimizeBones)
     {
         usdBoneWeights = new VtFloatArray((uint)sourceVertices.Length * elementSize);
         usdBoneIndices = new VtIntArray((uint)sourceVertices.Length * elementSize);
+
+        // 最適化時用のリマップ辞書（元のグローバルインデックス -> 新しいインデックス）
+        Dictionary<int, int> remapBoneIndex = new Dictionary<int, int>();
+        if (optimizeBones)
+        {
+            for (int i = 0; i < usedBoneIndices.Count; i++)
+            {
+                remapBoneIndex[usedBoneIndices[i]] = i;
+            }
+        }
 
         int flatIndex = 0;
         foreach (var section in sections)
@@ -441,8 +490,16 @@ public static class USkeletalMeshToUSD
                     usdBoneWeights[flatIndex] = vertex.Infs.BoneWeight[i] / 255.0f;
                     int localBoneIndex = vertex.Infs.BoneIndex[i];
                     int globalBoneIndex = boneMap[localBoneIndex]; // sourceBoneIndexMapのインデックスに相当するグローバルインデックスにマッピング
-                    usdBoneIndices[flatIndex] = globalBoneIndex;
 
+                    // 最適化時はリマップされたインデックスを使う
+                    if (optimizeBones && remapBoneIndex.TryGetValue(globalBoneIndex, out int remappedIndex))
+                    {
+                        usdBoneIndices[flatIndex] = remappedIndex;
+                    }
+                    else
+                    {
+                        usdBoneIndices[flatIndex] = globalBoneIndex;
+                    }
 
                     if (usdBoneWeights[flatIndex] == 0)
                         usdBoneIndices[flatIndex] = 0;
@@ -460,15 +517,16 @@ public static class USkeletalMeshToUSD
         }
     }
 
-    private static VtTokenArray BuildUsdBonePaths(FMeshBoneInfo[] boneInfo, Dictionary<string, int> boneIndexMap)
+    private static VtTokenArray BuildUsdBonePaths(FMeshBoneInfo[] boneInfo, List<int> usedBoneIndices)
     {
-        var usdBones = new VtTokenArray((uint)boneInfo.Length);
-        var bonePaths = new List<string>(boneInfo.Length);
+        var usdBones = new VtTokenArray((uint)usedBoneIndices.Count);
+        var bonePaths = new List<string>(usedBoneIndices.Count);
 
-        for (int i = 0; i < boneInfo.Length; i++)
+        for (int i = 0; i < usedBoneIndices.Count; i++)
         {
+            int originalIndex = usedBoneIndices[i];
             var pathBuilder = new StringBuilder();
-            int currentIndex = i;
+            int currentIndex = originalIndex;
             while (currentIndex >= 0)
             {
                 var boneName = boneInfo[currentIndex].Name;
