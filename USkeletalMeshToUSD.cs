@@ -2,36 +2,34 @@
 using BCnEncoder.Shared;
 using CUE4Parse.UE4.Assets;
 using CUE4Parse.UE4.Assets.Exports;
+using CUE4Parse.UE4.Assets.Exports.Animation;
 using CUE4Parse.UE4.Assets.Exports.Material;
 using CUE4Parse.UE4.Assets.Exports.SkeletalMesh;
 using CUE4Parse.UE4.Assets.Exports.Texture;
 using CUE4Parse.UE4.Objects.Core.Math;
+using CUE4Parse.UE4.Objects.RenderCore;
 using CUE4Parse.UE4.Objects.UObject;
 using pxr;
 using SixLabors.ImageSharp;
 using SixLabors.ImageSharp.PixelFormats;
 using System;
+using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Numerics;
+using System.Reflection;
 using System.Text;
+using static System.Collections.Specialized.BitVector32;
 
 public static class USkeletalMeshToUSD
 {
-    // 元の Unreal Engine アセット名を格納するためのカスタム属性名
     private const string OriginalNameAttribute = "UEOriginalName";
-    // 元の Unreal Engine マテリアルスロット名を格納するためのカスタム属性名
     private const string OriginalMaterialSlotNameAttribute = "UEOriginalMaterialSlotName";
-
-    // デフォルトの USD Scope パス（実行時に変更可能）
-    // 例: USkeletalMeshToUSD.ScopePath = "/MyCustomGeo";
     public static string ScopePath { get; set; } = "/Geo";
+    public static string ScopeSkeletonPath { get; set; } = "/Skeleton";
+    public static string ScopeSkeletonsXformPath { get; set; } = "/SkeletonsXform";
 
-    /// <summary>
-    /// USDの命名規則に準拠するように文字列をサニタイズします。
-    /// 英数字とアンダースコアのみを許可し、先頭が数字の場合はアンダースコアを付与します。
-    /// </summary>
-    private static string SanitizeUsdName(string name)
+    public static string SanitizeUsdName(string name)
     {
         if (string.IsNullOrEmpty(name))
         {
@@ -41,7 +39,7 @@ public static class USkeletalMeshToUSD
         var sanitizedBuilder = new StringBuilder(name.Length);
         foreach (char c in name)
         {
-            if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_')
+            if (char.IsLetterOrDigit(c) || c == '_')
             {
                 sanitizedBuilder.Append(c);
             }
@@ -60,188 +58,119 @@ public static class USkeletalMeshToUSD
     }
 
     /// <summary>
-    /// USkeletalMeshをUSDファイルに変換し、指定されたディレクトリに保存します。
+    /// 分割してUSDを出力するメイン（Geo, Skeleton, Root の3ファイルを作る）
     /// </summary>
-    /// <param name="skeletalMesh">変換対象のスケルタルメッシュ</param>
-    /// <param name="outputDirectory">出力先ディレクトリ</param>
-    public static void Convert(USkeletalMesh skeletalMesh, string outputDirectory)
+    public static void ConvertToSplitUsd(USkeletalMesh skeletalMesh, string outputDirectory)
     {
         if (skeletalMesh == null) throw new ArgumentNullException(nameof(skeletalMesh));
         if (string.IsNullOrEmpty(outputDirectory)) throw new ArgumentNullException(nameof(outputDirectory));
-
         Directory.CreateDirectory(outputDirectory);
 
         var originalAssetName = skeletalMesh.Name ?? "UnnamedSkeletalMesh";
         var sanitizedPrimName = SanitizeUsdName(originalAssetName);
-        var outputFilePath = Path.Combine(outputDirectory, sanitizedPrimName + ".usda");
 
-        using (var stage = UsdStage.CreateNew(outputFilePath))
+        // ファイル名
+        var geoFile = Path.Combine(outputDirectory, sanitizedPrimName + "_geo.usda");
+        var skeletonFile = Path.Combine(outputDirectory, sanitizedPrimName + "_skeleton.usda");
+        var rootFile = Path.Combine(outputDirectory, sanitizedPrimName + "_root.usda");
+
+        // LODチェック
+        if (skeletalMesh.LODModels == null || skeletalMesh.LODModels.Length == 0) return;
+        var lodModel = skeletalMesh.LODModels[0];
+        if (lodModel.VertexBufferGPUSkin?.VertsFloat == null || lodModel.Indices == null) return;
+
+        var sourceVertices = lodModel.VertexBufferGPUSkin.VertsFloat;
+        var sourceIndices = GetSourceIndices(lodModel.Indices);
+        if (sourceVertices.Length == 0 || sourceIndices.Length == 0) return;
+        var sourceBoneInfo = skeletalMesh.ReferenceSkeleton.FinalRefBoneInfo;
+        var sourceBoneIndexMap = skeletalMesh.ReferenceSkeleton.FinalNameToIndexMap;
+
+        // 頂点/法線・スキニングデータを作成（メモリ表現）
+        ProcessVerticesAndNormals(sourceVertices, out VtVec3fArray usdVertices, out VtVec3fArray usdNormals);
+
+        uint maxElementSize = 0;
+        foreach (var section in lodModel.Sections)
         {
-            if (stage == null)
-            {
-                throw new InvalidOperationException($"Failed to create USD stage at '{outputFilePath}'");
-            }
-            UsdGeom.UsdGeomSetStageUpAxis(stage, UsdGeomTokens.y); // Y-Up
+            maxElementSize = Math.Max(maxElementSize, (uint)section.MaxBoneInfluences);
+        }
+        uint elementSize = maxElementSize;
+        ProcessSkinningData(sourceVertices, lodModel.Sections, out VtFloatArray usdBoneWeights, out VtIntArray usdBoneIndices, elementSize);
+
+        var usdBones = BuildUsdBonePaths(sourceBoneInfo, sourceBoneIndexMap);
+
+        // 1) Geo ファイル作成（ジオメトリ + スキン属性を含める。ただし Skeleton 参照はここでは付けない）
+        WriteGeoUsd(geoFile, sanitizedPrimName, originalAssetName, usdVertices, usdNormals, sourceIndices, usdBoneWeights, usdBoneIndices, usdBones, elementSize, skeletalMesh);
+
+        // 2) Skeleton ファイル作成（スケルトン / ジョイントXform）
+        WriteSkeletonUsd(skeletonFile, sanitizedPrimName, skeletalMesh, sourceBoneInfo, usdBones);
+
+        // 3) Root ファイル作成（UsdSkelRoot を作り、geo/skeleton を reference で取り込む。さらに mesh -> skeleton の binding を作る）
+        WriteRootUsd(rootFile, sanitizedPrimName, geoFile, skeletonFile);
+
+    }
+
+    // Geo用USDを書き出す（メッシュとスキンのattrsを持つが、Skeleton参照は持たない）
+    private static void WriteGeoUsd(string filePath, string primName, string originalAssetName, VtVec3fArray points, VtVec3fArray normals, int[] indices, VtFloatArray jointWeights, VtIntArray jointIndices, VtTokenArray usdBones, uint elementSize, USkeletalMesh skeletalMesh)
+    {
+        using (var stage = UsdStage.CreateNew(filePath))
+        {
+            if (stage == null) throw new InvalidOperationException($"Failed to create Geo USD: {filePath}");
+
+            // 普通は /Geo をルートにする
+            UsdGeom.UsdGeomSetStageUpAxis(stage, UsdGeomTokens.y);
             UsdGeom.UsdGeomSetStageMetersPerUnit(stage, 1);
 
+            var geoScope = UsdGeomScope.Define(stage, new SdfPath(ScopePath)); // e.g. /Geo
+            stage.SetDefaultPrim(geoScope.GetPrim());
 
-            // --- ルートプリムとスコープの作成 --- /Geo/PrimName
-            var scope = UsdGeomScope.Define(stage, ScopePath);
-            stage.SetDefaultPrim(scope.GetPrim());
-            var usdMesh = UsdGeomMesh.Define(stage, scope.GetPath().AppendChild(new TfToken(sanitizedPrimName)));
-            usdMesh.GetPrim().CreateAttribute(new TfToken(OriginalNameAttribute), Sdf.SdfGetValueTypeString()).Set(originalAssetName);
-            // --- メッシュの向きが右手系であることを指定 --- 
+            var meshPath = geoScope.GetPath().AppendChild(new TfToken(primName));
+            var usdMesh = UsdGeomMesh.Define(stage, meshPath);
+            usdMesh.GetPrim().CreateAttribute(new TfToken(OriginalNameAttribute), SdfValueTypeNames.String).Set(originalAssetName);
             usdMesh.CreateOrientationAttr().Set(UsdGeomTokens.rightHanded);
-            // --- スムーズシェーディングを無効にする ---
-            usdMesh.CreateSubdivisionSchemeAttr(new TfToken("none"));
+            usdMesh.CreateSubdivisionSchemeAttr().Set(new TfToken("none"));
 
-            // --- ジオメトリデータ（頂点、インデックス）の処理 ---
-            if (skeletalMesh.LODModels == null || skeletalMesh.LODModels.Length == 0)
+            // geometry attributes
+            usdMesh.CreatePointsAttr().Set(points);
+            usdMesh.CreateNormalsAttr().Set(normals);
+            usdMesh.SetNormalsInterpolation(UsdGeomTokens.vertex);
+
+            var faceVertexIndices = new VtIntArray((uint)indices.Length);
+            for (int i = 0; i < indices.Length; i++) faceVertexIndices[i] = indices[i];
+            usdMesh.CreateFaceVertexIndicesAttr().Set(faceVertexIndices);
+            uint triCount = (uint)(indices.Length / 3);
+            var faceVertexCounts = new VtIntArray(triCount);
+            for (int i = 0; i < triCount; i++) faceVertexCounts[i] = 3;
+            usdMesh.CreateFaceVertexCountsAttr().Set(faceVertexCounts);
+
+            // スキニング属性（jointIndices / jointWeights）を頂点インターポレーションで付与
+            // UsdSkelBinding は Root 側で行う予定だが、indices/weights自体はメッシュ側に含めておく
+            var prim = usdMesh.GetPrim();
+
+            var usdSkin = UsdSkelBindingAPI.Apply(usdMesh.GetPrim());
+            // jointWeights
+            var jointWeightsAttr = usdSkin.CreateJointWeightsAttr(jointWeights);
+            jointWeightsAttr.SetMetadata(new TfToken("elementSize"), elementSize);
+            jointWeightsAttr.SetMetadata(new TfToken("interpolation"), UsdGeomTokens.vertex);
+            // jointIndices
+            var jointIndicesAttr = usdSkin.CreateJointIndicesAttr(jointIndices);
+            jointIndicesAttr.SetMetadata(new TfToken("elementSize"), elementSize);
+            jointIndicesAttr.SetMetadata(new TfToken("interpolation"), UsdGeomTokens.vertex);
+
+            // Jointのパス 一応持っておく
+            usdSkin.CreateJointsAttr(usdBones);
+
+
+            // blendshape
+            foreach (var item in skeletalMesh.MorphTargets)
             {
-                return; // エクスポートするデータがない
+
             }
 
             var lodModel = skeletalMesh.LODModels[0];
-            if (lodModel.VertexBufferGPUSkin?.VertsFloat == null || lodModel.Indices == null)
-            {
-                return;
-            }
-
-            var sourceVertices = lodModel.VertexBufferGPUSkin.VertsFloat;
-            int[] sourceIndices;
-            if (lodModel.Indices.Indices16 != null && lodModel.Indices.Indices16.Length > 0)
-            {
-                sourceIndices = Array.ConvertAll(lodModel.Indices.Indices16, i => (int)i);
-            }
-            else if (lodModel.Indices.Indices32 != null && lodModel.Indices.Indices32.Length > 0)
-            {
-                sourceIndices = lodModel.Indices.Indices32.Select(i => (int)i).ToArray();
-            }
-            else
-            {
-                sourceIndices = Array.Empty<int>();
-            }
-
-            if (sourceVertices.Length == 0 || sourceIndices.Length == 0)
-            {
-                return; // エクスポートするデータがない
-            }
-
-            var sourceBoneInfo = skeletalMesh.ReferenceSkeleton.FinalRefBoneInfo;
-            var sourceBoneIndexMap = skeletalMesh.ReferenceSkeleton.FinalNameToIndexMap;
-
-            // 頂点座標を設定
-            var usdVertices = new VtVec3fArray();
-            var usdNormals = new VtVec3fArray();
-            var usdBoneWeights = new VtFloatArray();
-            var usdBoneIndices = new VtIntArray();
-            // rootBoneから対象のボーンまでのパス 先頭に/はつけない
-            var usdBones = new VtTokenArray();
-            foreach (var joint in sourceBoneInfo)
-            {
-                sourceBoneIndexMap.Keys.ToList();
-                sourceBoneIndexMap.Values.ToList();
-
-                var parentIndex = joint.ParentIndex;
-                var path = joint.Name;
-            }
-
-            // ボーンウェイトの要素数（最大4など）を取得
-            int elementSize = sourceVertices.Max(list => list.Infs.BoneWeight.Length);
-
-            foreach (var vertex in sourceVertices)
-            {
-                // --- 頂点座標を取得 ---
-                var uePos = vertex.Pos;
-                // --- 法線 3つ目が法線 --- 
-                var ueNormal = vertex.Normal[2]; // 法線取得
-                // --- ボーンウェイト ---
-                for (int i = 0; i < elementSize; i++)
-                {
-                    var w = vertex.Infs.BoneWeight[i] / 255.0f;
-                    usdBoneWeights.push_back(w);
-                    usdBoneIndices.push_back(vertex.Infs.BoneIndex[i]);
-                }
-
-                // --- スケール変換 (単位を cm -> m に) ---
-                uePos *= 0.01f;
-                // 法線は方向ベクトルなので、スケール変換は不要。
+            var outputDirectory = Path.GetDirectoryName(filePath);
 
 
-                // --- 座標系の変換 (UE -> USD) ---
-                // ルール: USD(x, y, z) = UE(y, z, -x)
-
-                // 頂点座標の変換
-                var usdPosX = uePos.Y; // USDのXはUEのY
-                var usdPosY = uePos.Z; // USDのYはUEのZ
-                var usdPosZ = -uePos.X; // USDのZはUEの-X
-
-                // 2) USD 空間で +90° Y 回転 (x' = z, z' = -x)
-                float t = usdPosX;
-                usdPosX = usdPosZ;    // x' = z
-                usdPosZ = -t;         // z' = -x
-
-                // 法線の変換 (頂点座標と同じルールを適用します)
-                var usdNormalX = ueNormal.Y;
-                var usdNormalY = ueNormal.Z;
-                var usdNormalZ = -ueNormal.X;
-
-                // 法線：同じ順でマップ→回転→正規化
-                var nX = ueNormal.Y;
-                var nY = ueNormal.Z;
-                var nZ = -ueNormal.X;
-                float nt = nX;
-                nX = nZ;   // x' = z
-                nZ = -nt;  // z' = -x
-                var normalVec = Vector3.Normalize(new Vector3(nX, nY, nZ));
-
-                // --- USD 空間で Y 軸 180° 回転（追加） ---
-                // 回転 (x, y, z) -> (-x, y, -z)
-                usdPosX = -usdPosX;
-                usdPosZ = -usdPosZ;
-
-                // 法線も同じ回転（既に normalVec を作っている場合）
-                normalVec = new Vector3(-normalVec.X, normalVec.Y, -normalVec.Z);
-                normalVec = Vector3.Normalize(normalVec);
-
-
-                // --- USDの配列に変換後のデータを追加 ---
-                usdVertices.push_back(new GfVec3f(usdPosX, usdPosY, usdPosZ));
-                //usdNormals.push_back(new GfVec3f(usdNormalX, usdNormalY, usdNormalZ));
-                usdNormals.push_back(new GfVec3f(normalVec.X, normalVec.Y, normalVec.Z));
-            }
-            usdMesh.CreatePointsAttr().Set(usdVertices);
-            usdMesh.CreateNormalsAttr().Set(usdNormals);
-            // 法線の補間タイプを「vertex」（頂点単位）に設定（スムーズシェーディングに必要）
-            usdMesh.SetNormalsInterpolation(new TfToken("vertex"));
-
-
-            // 面ごとの頂点インデックスを設定（三角形リストをフラット化）            
-            var faceVertexIndices = new VtIntArray();
-            foreach (var index in sourceIndices)
-            {
-                faceVertexIndices.push_back((int)index);
-            }            
-            usdMesh.CreateFaceVertexIndicesAttr().Set(faceVertexIndices);
-
-            // 面ごとの頂点数を設定（すべて三角形なので3）
-            uint triangleCount = (uint)(sourceIndices.Length / 3);
-            var faceVertexCounts = new VtIntArray();
-            for (int i = 0; i < triangleCount; i++)
-            {
-                faceVertexCounts.push_back(3);
-            }
-            usdMesh.CreateFaceVertexCountsAttr().Set(faceVertexCounts);
-
-            // BoneWeight
-            var usdSkin = UsdSkelBindingAPI.Apply(usdMesh.GetPrim());
-            var usdJointWeightsAttr = usdSkin.CreateJointWeightsAttr(usdBoneWeights);
-            usdJointWeightsAttr.SetMetadata(new TfToken("elementSize"), elementSize);
-            usdJointWeightsAttr.SetMetadata(new TfToken("interpolation"), "vertex");
-            var usdJointIndicesAttr = usdSkin.CreateJointIndicesAttr(usdBoneIndices);
-            usdJointIndicesAttr.SetMetadata(new TfToken("elementSize"), elementSize);
-            usdJointIndicesAttr.SetMetadata(new TfToken("interpolation"), "vertex");
-
+            //ProcessSubsetsAndMaterials(usdMesh, lodModel, skeletalMesh, outputDirectory);
             // --- サブセット（マテリアルごとのグループ）とマテリアルの処理 ---
             try
             {
@@ -255,6 +184,7 @@ public static class USkeletalMeshToUSD
                 for (int sectionIndex = 0; sectionIndex < meshSections.Length; sectionIndex++)
                 {
                     var section = meshSections[sectionIndex];
+
                     var materialSlotName = skeletalMaterials.ElementAtOrDefault(section.MaterialIndex)?.MaterialSlotName.Text ?? $"mat_{section.MaterialIndex}";
 
 
@@ -289,7 +219,7 @@ public static class USkeletalMeshToUSD
                             var materialObject = materialInterfaces[section.MaterialIndex];
                             if (materialObject != null && materialObject.TryLoad(out UObject loadedMaterialObject) && loadedMaterialObject is UMaterialInstanceConstant materialInstance)
                             {
-                                ExportMaterialTextures(materialInstance, outputDirectory);
+                                UsdTextureExporter.ExportMaterialTextures(materialInstance, outputDirectory);
                             }
                         }
                         catch (Exception ex)
@@ -305,19 +235,330 @@ public static class USkeletalMeshToUSD
                 Console.WriteLine($"Warning: Failed during subset creation. {ex.Message}");
             }
 
-            // USDステージを保存
+
             stage.GetRootLayer().Save();
         }
     }
 
-    /// <summary>
-    /// マテリアルインスタンスからテクスチャを抽出し、PNGファイルとしてエクスポートします。
-    /// </summary>
-    private static void ExportMaterialTextures(UMaterialInstanceConstant materialInstance, string outputDirectory)
+    // Skeleton用USDを書き出す（UsdSkelSkeleton とジョイントXform群を出力）
+    private static void WriteSkeletonUsd(string filePath, string primName, USkeletalMesh skeletalMesh, FMeshBoneInfo[] boneInfo, VtTokenArray usdBones)
+    {
+        using (var stage = UsdStage.CreateNew(filePath))
+        {
+            if (stage == null) throw new InvalidOperationException($"Failed to create Skeleton USD: {filePath}");
+
+            UsdGeom.UsdGeomSetStageUpAxis(stage, UsdGeomTokens.y);
+            UsdGeom.UsdGeomSetStageMetersPerUnit(stage, 1);
+
+            // Skeleton scope
+            //var skelScope = UsdSkelRoot.Define(stage, new SdfPath(ScopeSkeletonPath)); // ここでは /Skeleton をルートにする
+            var skelScope = UsdGeomScope.Define(stage, new SdfPath(ScopeSkeletonPath)); // ここでは /Skeleton をルートにする
+            stage.SetDefaultPrim(skelScope.GetPrim());
+
+            // ジョイントXform群のスコープ
+            var skelXformScope = UsdGeomScope.Define(stage, new SdfPath(ScopeSkeletonsXformPath));
+
+            // Skeleton prim path: /Skeleton/<primName>
+            var skeletonName = SanitizeUsdName(skeletalMesh.Name ?? "Skeleton");
+            var skeletonPath = skelScope.GetPath().AppendChild(new TfToken(skeletonName));
+            var usdSkeleton = UsdSkelSkeleton.Define(stage, skeletonPath);
+
+            int numBones = boneInfo.Length;
+            var restArray = new VtMatrix4dArray((uint)numBones);
+            var bindArray = new VtMatrix4dArray((uint)numBones);
+            var jointNames = new VtTokenArray((uint)numBones);
+
+            var localMatrices = new GfMatrix4d[numBones];
+            var worldMatrices = new GfMatrix4d[numBones];
+
+            var usdXforms = new List<UsdGeomXform>();
+
+            for (int i = 0; i < numBones; i++)
+            {
+                var item = skeletalMesh.ReferenceSkeleton.FinalRefBonePose[i];
+                var uePos = item.Translation * 0.01f;
+                var transformedPos = UsdCoordinateTransformer.TransformPosition(uePos);
+                var ueRot = item.Rotation;
+                var transformedRot = UsdCoordinateTransformer.TransformRotation(ueRot);
+                var q_usd = new GfQuatd(transformedRot.W, transformedRot.X, transformedRot.Y, transformedRot.Z);
+
+                var localM = new GfMatrix4d(1).SetRotate(q_usd);
+                localM.SetTranslateOnly(new GfVec3d(transformedPos.X, transformedPos.Y, transformedPos.Z));
+                localMatrices[i] = localM;
+
+                // joint names
+                jointNames[i] = new TfToken(skeletalMesh.ReferenceSkeleton.FinalRefBoneInfo[i].Name.Text);
+
+                // create xform under /SkeletonsXform/<jointPath>
+                var pathBuilder = new StringBuilder();
+                int curr = i;
+                while (curr >= 0)
+                {
+                    pathBuilder.Insert(0, "/" + SanitizeUsdName(skeletalMesh.ReferenceSkeleton.FinalRefBoneInfo[curr].Name.Text));
+                    curr = skeletalMesh.ReferenceSkeleton.FinalRefBoneInfo[curr].ParentIndex;
+                }
+                var jointRelPath = pathBuilder.ToString().TrimStart('/');
+                var jointFullPath = new SdfPath(ScopeSkeletonsXformPath).AppendPath(new SdfPath(jointRelPath));
+                var usdXform = UsdGeomXform.Define(stage, jointFullPath);
+                usdXform.AddTransformOp().Set(localM);
+                usdXforms.Add(usdXform);
+
+                //UsdGeomCube.Define(stage, usdXform.GetPath().AppendChild(new TfToken("Cube"))).GetSizeAttr().Set(0.05);
+            }
+
+
+            var xformCacheAPI = new UsdGeomXformCache();
+            for (int i = 0; i < numBones; i++)
+            {
+                var parentIdx = boneInfo[i].ParentIndex;
+                if (parentIdx < 0) worldMatrices[i] = localMatrices[i];
+                else
+                {
+                    var xformPrim = usdXforms[i];
+                    worldMatrices[i] = xformCacheAPI.GetLocalToWorldTransform(xformPrim.GetPrim());
+                }
+            }
+
+            for (int i = 0; i < numBones; i++)
+            {
+                bindArray[i] = worldMatrices[i];
+                restArray[i] = localMatrices[i];
+            }
+
+            usdSkeleton.CreateBindTransformsAttr().Set(bindArray);
+            usdSkeleton.CreateRestTransformsAttr().Set(restArray);
+            usdSkeleton.CreateJointsAttr().Set(usdBones);
+            usdSkeleton.CreateJointNamesAttr().Set(jointNames);
+
+            stage.GetRootLayer().Save();
+        }
+    }
+
+    // Root USD を作り、geo/skeleton を reference で取り込む（結果として一つの SkelRoot 配下に統合される）
+    private static void WriteRootUsd(string filePath, string primName, string geoFilePath, string skeletonFilePath)
+    {
+        using (var stage = UsdStage.CreateNew(filePath))
+        {
+            if (stage == null) throw new InvalidOperationException($"Failed to create Root USD: {filePath}");
+
+            UsdGeom.UsdGeomSetStageUpAxis(stage, UsdGeomTokens.y);
+            UsdGeom.UsdGeomSetStageMetersPerUnit(stage, 1);
+
+            // ここで /SkelRoot を作成（名前は自由）
+            var skelRootPath = new SdfPath("/SkelRoot");
+            var skelRoot = UsdSkelRoot.Define(stage, skelRootPath);
+            stage.SetDefaultPrim(skelRoot.GetPrim());
+
+            // /SkelRoot/Geo を作り、それに geoFile を reference でマッピング
+            var geoTargetPath = skelRootPath.AppendPath(new SdfPath(ScopePath.TrimStart('/'))); // /SkelRoot/Geo
+            var geoPrim = stage.DefinePrim(geoTargetPath);
+            // 参照を追加： geoFile を参照して、その内部にある /Geo をここにマップ
+            // Sdf.Reference の呼び出し方はバインディング依存なので必要に応じて修正してください
+            geoPrim.GetReferences().AddReference(new SdfReference(Path.GetFileName(geoFilePath), new SdfPath(ScopePath)));
+
+            // 同様に /SkelRoot/Skeleton を作り、skeletonFile を reference
+            var skeletonTargetPath = skelRootPath.AppendPath(new SdfPath(ScopeSkeletonPath.TrimStart('/'))); // /SkelRoot/Skeleton
+            var skeletonPrim = stage.DefinePrim(skeletonTargetPath);
+            skeletonPrim.GetReferences().AddReference(new SdfReference(Path.GetFileName(skeletonFilePath), new SdfPath(ScopeSkeletonPath)));
+
+            // 最後に、Geo 内の Mesh と Skeleton の間に binding を作る（ここでは prim path を仮定）
+            // 例: /SkelRoot/Geo/<primName> がメッシュ、/SkelRoot/Skeleton/<skeletonName> がスケルトン
+            var meshPrimPath = geoTargetPath.AppendChild(new TfToken(primName)); // /SkelRoot/Geo/<primName>
+            var skeletonName = SanitizeUsdName(primName); // ここはユーザーの命名規則に合わせて調整
+            var skeletonPrimPath = skeletonTargetPath.AppendChild(new TfToken(skeletonName)); // /SkelRoot/Skeleton/<skeletonName>
+
+            var meshPrim = stage.GetPrimAtPath(meshPrimPath);
+            if (meshPrim.IsValid())
+            {
+                // UsdSkelBindingAPI を用いて skeleton のリレーションを作成
+                var bindingApi = UsdSkelBindingAPI.Apply(meshPrim);
+                bindingApi.CreateSkeletonRel().AddTarget(skeletonPrimPath);
+            }
+            else
+            {
+                Console.WriteLine($"Warning: mesh prim {meshPrimPath} not present in composed stage at this time. Binding deferred.");
+            }
+
+            stage.GetRootLayer().Save();
+        }
+
+        // 重要: root.usda に記述した reference は相対パスとして機能するように、
+        // geoFilePath と skeletonFilePath を同じディレクトリに置いてください（ここではファイル名のみを参照に使っています）。
+    }
+
+    private static int[] GetSourceIndices(FMultisizeIndexContainer indices)
+    {
+        if (indices.Indices16 != null && indices.Indices16.Length > 0)
+        {
+            return Array.ConvertAll(indices.Indices16, i => (int)i);
+        }
+        else if (indices.Indices32 != null && indices.Indices32.Length > 0)
+        {
+            return indices.Indices32.Select(i => (int)i).ToArray();
+        }
+        return Array.Empty<int>();
+    }
+
+    private static void ProcessVerticesAndNormals(FGPUVertFloat[] sourceVertices, out VtVec3fArray usdVertices, out VtVec3fArray usdNormals)
+    {
+        usdVertices = new VtVec3fArray((uint)sourceVertices.Length);
+        usdNormals = new VtVec3fArray((uint)sourceVertices.Length);
+
+        for (int i = 0; i < sourceVertices.Length; i++)
+        {
+            var vertex = sourceVertices[i];
+            var uePos = vertex.Pos * 0.01f; // Scale to meters
+            var ueNormal = vertex.Normal[2]; // 3つ目が法線
+
+            var transformedPos = UsdCoordinateTransformer.TransformPosition(uePos);
+            var transformedNormal = UsdCoordinateTransformer.TransformNormal(ueNormal);
+
+            usdVertices[i] = new GfVec3f(transformedPos.X, transformedPos.Y, transformedPos.Z);
+            usdNormals[i] = new GfVec3f(transformedNormal.X, transformedNormal.Y, transformedNormal.Z);
+        }
+    }
+
+    private static void ProcessSkinningData(FGPUVertFloat[] sourceVertices, FSkelMeshSection[] sections, out VtFloatArray usdBoneWeights, out VtIntArray usdBoneIndices, uint elementSize)
+    {
+        usdBoneWeights = new VtFloatArray((uint)sourceVertices.Length * elementSize);
+        usdBoneIndices = new VtIntArray((uint)sourceVertices.Length * elementSize);
+
+        int flatIndex = 0;
+        foreach (var section in sections)
+        {
+            // 使われてるBone のリスト
+            var boneMap = section.BoneMap;
+            int startVertex = (int)section.BaseVertexIndex;
+            int numVertices = (int)section.NumVertices;
+            uint sectionInfluences = (uint)section.MaxBoneInfluences;
+
+            for (int v = 0; v < numVertices; v++)
+            {
+                var vertex = sourceVertices[startVertex + v];
+
+                for (int i = 0; i < sectionInfluences; i++)
+                {
+                    usdBoneWeights[flatIndex] = vertex.Infs.BoneWeight[i] / 255.0f;
+                    int localBoneIndex = vertex.Infs.BoneIndex[i];
+                    int globalBoneIndex = boneMap[localBoneIndex]; // sourceBoneIndexMapのインデックスに相当するグローバルインデックスにマッピング
+                    usdBoneIndices[flatIndex] = globalBoneIndex;
+
+
+                    if (usdBoneWeights[flatIndex] == 0)
+                        usdBoneIndices[flatIndex] = 0;
+                    flatIndex++;
+                }
+
+                // パディング: sectionInfluences < elementSize の場合、0で埋める
+                for (int i = (int)sectionInfluences; i < elementSize; i++)
+                {
+                    usdBoneWeights[flatIndex] = 0.0f;
+                    usdBoneIndices[flatIndex] = 0; // ウェイト0なのでインデックスは任意（0でOK）
+                    flatIndex++;
+                }
+            }
+        }
+    }
+
+    private static VtTokenArray BuildUsdBonePaths(FMeshBoneInfo[] boneInfo, Dictionary<string, int> boneIndexMap)
+    {
+        var usdBones = new VtTokenArray((uint)boneInfo.Length);
+        var bonePaths = new List<string>(boneInfo.Length);
+
+        for (int i = 0; i < boneInfo.Length; i++)
+        {
+            var pathBuilder = new StringBuilder();
+            int currentIndex = i;
+            while (currentIndex >= 0)
+            {
+                var boneName = boneInfo[currentIndex].Name;
+                pathBuilder.Insert(0, "/" + SanitizeUsdName(boneName.Text));
+                currentIndex = boneInfo[currentIndex].ParentIndex;
+            }
+            bonePaths.Add(pathBuilder.ToString().TrimStart('/')); // Remove leading '/' for relative path
+        }
+
+        for (int i = 0; i < bonePaths.Count; i++)
+        {
+            usdBones[i] = new TfToken(bonePaths[i]);
+        }
+
+        return usdBones;
+    }
+
+}
+
+public static class UsdCoordinateTransformer
+{
+    public static Vector3 TransformPosition(FVector uePos)
+    {
+        // UE to USD mapping: USD(x, y, z) = UE(y, z, -x)
+        float usdX = uePos.Y;
+        float usdY = uePos.Z;
+        float usdZ = -uePos.X; // 左手座標系から右手座標系に
+
+        // -90° Y rotation: x' = -z, z' = x
+        float temp = usdX;
+        usdX = -usdZ; // x' = -(-uePos.X) = uePos.X
+        usdZ = temp;  // z' = uePos.Y
+
+        return new Vector3(usdX, usdY, usdZ);
+    }
+
+    public static Quaternion TransformRotation(FQuat ueRot)
+    {
+        var q_ue = new Quaternion(ueRot.X, ueRot.Y, ueRot.Z, ueRot.W);
+        var r_ue = Matrix4x4.CreateFromQuaternion(q_ue);
+
+        var T = new Matrix4x4(
+            0, 1, 0, 0,
+            0, 0, 1, 0,
+            -1, 0, 0, 0,
+            0, 0, 0, 1
+        );
+
+        var R_mat = new Matrix4x4(
+            0, 0, -1, 0,
+            0, 1, 0, 0,
+            1, 0, 0, 0,
+            0, 0, 0, 1
+        );
+
+        var M = Matrix4x4.Multiply(R_mat, T);
+
+        if (!Matrix4x4.Invert(M, out var invM))
+        {
+            throw new InvalidOperationException("Cannot invert coordinate transformation matrix.");
+        }
+
+        var r_usd = Matrix4x4.Multiply(M, Matrix4x4.Multiply(r_ue, invM));
+        var q_usd = Quaternion.CreateFromRotationMatrix(r_usd);
+        return Quaternion.Normalize(q_usd);
+    }
+
+    public static Vector3 TransformNormal(FPackedNormal ueNormal)
+    {
+        // UE to USD mapping: USD(x, y, z) = UE(y, z, -x)
+        float nX = ueNormal.Y;
+        float nY = ueNormal.Z;
+        float nZ = -ueNormal.X; // 左手座標系から右手座標系に
+
+        // -90° Y rotation: x' = -z, z' = x
+        float nTemp = nX;
+        nX = -nZ;
+        nZ = nTemp;
+
+        return Vector3.Normalize(new Vector3(nX, nY, nZ));
+    }
+}
+
+public static class UsdTextureExporter
+{
+    public static void ExportMaterialTextures(UMaterialInstanceConstant materialInstance, string outputDirectory)
     {
         if (materialInstance == null) return;
 
-        var materialDirectoryPath = Path.Combine(outputDirectory, SanitizeUsdName(materialInstance.Name ?? "Material"));
+        var materialDirectoryPath = Path.Combine(outputDirectory, USkeletalMeshToUSD.SanitizeUsdName(materialInstance.Name ?? "Material"));
         Directory.CreateDirectory(materialDirectoryPath);
 
         var decoder = new BcDecoder();
@@ -334,8 +575,8 @@ public static class USkeletalMeshToUSD
                     continue;
                 }
 
-                // バーチャルテクスチャはスキップ
-                if (texture2D.PlatformData?.VTData != null) continue;
+                if (texture2D.PlatformData?.VTData != null)
+                    continue; // Skip virtual textures
 
                 var mipMap = texture2D.GetFirstMip();
                 if (mipMap?.BulkData?.Data == null || mipMap.SizeX == 0 || mipMap.SizeY == 0) continue;
@@ -344,169 +585,120 @@ public static class USkeletalMeshToUSD
                 int width = mipMap.SizeX;
                 int height = mipMap.SizeY;
 
-                byte[] decodedPixelData = null;
-
-                switch (texture2D.Format)
-                {
-                    case EPixelFormat.PF_B8G8R8A8:
-                    case EPixelFormat.PF_G8:
-                        decodedPixelData = compressedData; // 既に非圧縮
-                        break;
-                    case EPixelFormat.PF_FloatRGBA:
-                        if (texture2D.IsHDR)
-                        {
-                            decodedPixelData = compressedData; // 既に非圧縮
-                        }
-                        break;
-                    case EPixelFormat.PF_DXT1:
-                        decodedPixelData = DecodeToBgra(decoder, compressedData, width, height, CompressionFormat.Bc1);
-                        break;
-
-                    case EPixelFormat.PF_DXT5:
-                        decodedPixelData = DecodeToBgra(decoder, compressedData, width, height, CompressionFormat.Bc3);
-                        break;
-
-                    case EPixelFormat.PF_BC5:
-                        decodedPixelData = DecodeToBgra(decoder, compressedData, width, height, CompressionFormat.Bc5);
-                        // 法線マップの場合、Zチャンネル（青）を再構築
-                        if (texture2D.IsNormalMap && decodedPixelData != null)
-                        {
-                            ReconstructNormalMapZChannel(decodedPixelData, width, height);
-                        }
-                        break;
-
-                    case EPixelFormat.PF_BC7:
-                        decodedPixelData = DecodeToBgra(decoder, compressedData, width, height, CompressionFormat.Bc7);
-                        break;
-
-                    default:
-                        // サポート外のフォーマットはスキップ
-                        continue;
-                }
+                byte[] decodedPixelData = DecodeTextureData(decoder, texture2D, compressedData, width, height);
 
                 if (decodedPixelData == null) continue;
 
-                if (texture2D.IsTextureCube)
-                {
-                    continue;
-                }
+                if (texture2D.IsTextureCube) continue;
 
+                var outputFilePath = Path.Combine(materialDirectoryPath, texture2D.Name) + (texture2D.IsHDR ? ".exr" : ".png");
 
-                var outputFilePath = Path.Combine(materialDirectoryPath, texture2D.Name);
-
-                if (texture2D.IsHDR)
-                {
-                    try
-                    {
-                        outputFilePath += ".hdr";
-                        using (var image = Image.LoadPixelData<RgbaVector>(decodedPixelData, width, height))
-                        {
-                            image.SaveAsPng(outputFilePath);
-                        }
-                    }
-                    catch (Exception ex)
-                    {
-                        Console.WriteLine($"Failed to save texture '{texture2D.Name}' to '{outputFilePath}': {ex.Message}");
-                    }                    
-                }
-                else
-                {
-                    try
-                    {
-                        outputFilePath += ".png";
-                        using (var image = Image.LoadPixelData<Bgra32>(decodedPixelData, width, height))
-                        {
-                            image.SaveAsPng(outputFilePath);
-                        }
-                    }
-                    catch (Exception ex)
-                    {
-                        Console.WriteLine($"Failed to save texture '{texture2D.Name}' to '{outputFilePath}': {ex.Message}");
-                    }
-                }
+                SaveTextureImage(decodedPixelData, width, height, texture2D.IsHDR, outputFilePath);
             }
             catch (Exception ex)
             {
-                // 個別のテクスチャ処理でエラーが発生しても、他のテクスチャの処理を続行
                 Console.WriteLine($"Warning: Failed to export a texture parameter. {ex.Message}");
             }
         }
     }
 
-    /// <summary>
-    /// BCn圧縮されたピクセルデータをBGRA32形式のバイト配列にデコードします。
-    /// </summary>
-    private static byte[] DecodeToBgra(BcDecoder decoder, byte[] compressedData, int width, int height, CompressionFormat compressionFormat)
+    private static byte[] DecodeTextureData(BcDecoder decoder, UTexture2D texture2D, byte[] compressedData, int width, int height)
+    {
+        byte[] decodedPixelData = null;
+
+        switch (texture2D.Format)
+        {
+            case EPixelFormat.PF_B8G8R8A8:
+            case EPixelFormat.PF_G8:
+            case EPixelFormat.PF_FloatRGBA when texture2D.IsHDR:
+                decodedPixelData = compressedData;
+                break;
+            case EPixelFormat.PF_DXT1:
+                decodedPixelData = DecodeToBgra(decoder, compressedData, width, height, CompressionFormat.Bc1);
+                break;
+            case EPixelFormat.PF_DXT5:
+                decodedPixelData = DecodeToBgra(decoder, compressedData, width, height, CompressionFormat.Bc3);
+                break;
+            case EPixelFormat.PF_BC5:
+                decodedPixelData = DecodeToBgra(decoder, compressedData, width, height, CompressionFormat.Bc5);
+                if (texture2D.IsNormalMap && decodedPixelData != null)
+                {
+                    ReconstructNormalMapZChannel(decodedPixelData, width, height);
+                }
+                break;
+            case EPixelFormat.PF_BC7:
+                decodedPixelData = DecodeToBgra(decoder, compressedData, width, height, CompressionFormat.Bc7);
+                break;
+            default:
+                return null;
+        }
+
+        return decodedPixelData;
+    }
+
+    private static void SaveTextureImage(byte[] decodedPixelData, int width, int height, bool isHDR, string outputFilePath)
+    {
+        try
+        {
+            if (isHDR)
+            {
+                using (var image = Image.LoadPixelData<RgbaVector>(decodedPixelData, width, height))
+                {
+                    image.SaveAsPng(outputFilePath);
+                }
+            }
+            else
+            {
+                using (var image = Image.LoadPixelData<Bgra32>(decodedPixelData, width, height))
+                {
+                    image.SaveAsPng(outputFilePath);
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"Failed to save texture to '{outputFilePath}': {ex.Message}");
+        }
+    }
+
+    private static byte[] DecodeToBgra(BcDecoder decoder, byte[] compressedData, int width, int height, CompressionFormat format)
     {
         if (compressedData == null || compressedData.Length == 0) return null;
         try
         {
-            var decodedPixels = decoder.DecodeRaw(compressedData, width, height, compressionFormat);
+            var decodedPixels = decoder.DecodeRaw(compressedData, width, height, format);
             if (decodedPixels == null || decodedPixels.Length == 0) return null;
 
-            var bgraPixelData = new byte[width * height * 4];
+            var bgraPixelData = new byte[decodedPixels.Length * 4];
             for (int i = 0; i < decodedPixels.Length; i++)
             {
                 var pixel = decodedPixels[i];
                 int offset = i * 4;
-                bgraPixelData[offset + 0] = pixel.b; // Blue
-                bgraPixelData[offset + 1] = pixel.g; // Green
-                bgraPixelData[offset + 2] = pixel.r; // Red
-                bgraPixelData[offset + 3] = pixel.a; // Alpha
+                bgraPixelData[offset + 0] = pixel.b;
+                bgraPixelData[offset + 1] = pixel.g;
+                bgraPixelData[offset + 2] = pixel.r;
+                bgraPixelData[offset + 3] = pixel.a;
             }
             return bgraPixelData;
         }
         catch (Exception ex)
         {
-            Console.WriteLine($"Error during texture decoding with format {compressionFormat}: {ex.Message}");
+            Console.WriteLine($"Error during texture decoding with format {format}: {ex.Message}");
             return null;
         }
     }
 
-    /// <summary>
-    /// 2チャンネルの法線マップ（R=X, G=Y）からZ成分を再構築し、Bチャンネルに書き込みます。
-    /// </summary>
     private static void ReconstructNormalMapZChannel(byte[] bgraPixelData, int width, int height)
     {
         int pixelCount = width * height;
         for (int i = 0; i < pixelCount; i++)
         {
             int offset = i * 4;
-            // [0, 255] の範囲を [-1, 1] の範囲に正規化
-            double normalX = (bgraPixelData[offset + 2] / 255.0) * 2.0 - 1.0; // Red channel
-            double normalY = (bgraPixelData[offset + 1] / 255.0) * 2.0 - 1.0; // Green channel
-
-            // z^2 = 1 - x^2 - y^2
+            double normalX = (bgraPixelData[offset + 2] / 255.0) * 2.0 - 1.0; // Red
+            double normalY = (bgraPixelData[offset + 1] / 255.0) * 2.0 - 1.0; // Green
             double zSquared = 1.0 - normalX * normalX - normalY * normalY;
             double normalZ = Math.Sqrt(Math.Max(0.0, zSquared));
-
-            // [-1, 1] の範囲を [0, 255] の範囲に戻してBチャンネルに格納
-            bgraPixelData[offset + 0] = (byte)(Math.Clamp(normalZ, 0.0, 1.0) * 255.0); // Blue channel
+            bgraPixelData[offset + 0] = (byte)(Math.Clamp(normalZ, 0.0, 1.0) * 255.0); // Blue
         }
-    }
-
-    /// <summary>
-    /// Unreal Engine の FMatrix に似た構造のオブジェクトを USD の GfMatrix4d に変換します。
-    /// </summary>
-    /// <remarks>
-    /// CUE4ParseのFMatrixが直接参照できない場合を想定し、dynamic型を使用しています。
-    /// </remarks>
-    private static GfMatrix4d ConvertFMatrixToMatrix4d(dynamic ueMatrix)
-    {
-        var resultMatrix = new GfMatrix4d(); // デフォルトで単位行列
-        try
-        {
-            // 行優先で値を設定
-            //resultMatrix[0, 0] = ueMatrix.M[0][0]; resultMatrix[0, 1] = ueMatrix.M[0][1]; resultMatrix[0, 2] = ueMatrix.M[0][2]; resultMatrix[0, 3] = ueMatrix.M[0][3];
-            //resultMatrix[1, 0] = ueMatrix.M[1][0]; resultMatrix[1, 1] = ueMatrix.M[1][1]; resultMatrix[1, 2] = ueMatrix.M[1][2]; resultMatrix[1, 3] = ueMatrix.M[1][3];
-            //resultMatrix[2, 0] = ueMatrix.M[2][0]; resultMatrix[2, 1] = ueMatrix.M[2][1]; resultMatrix[2, 2] = ueMatrix.M[2][2]; resultMatrix[2, 3] = ueMatrix.M[2][3];
-            //resultMatrix[3, 0] = ueMatrix.M[3][0]; resultMatrix[3, 1] = ueMatrix.M[3][1]; resultMatrix[3, 2] = ueMatrix.M[3][2]; resultMatrix[3, 3] = ueMatrix.M[3][3];
-        }
-        catch (Exception ex)
-        {
-            Console.WriteLine($"Warning: Failed to convert FMatrix to GfMatrix4d, returning identity matrix. {ex.Message}");
-            // 失敗した場合は単位行列を返す
-        }
-        return resultMatrix;
     }
 }

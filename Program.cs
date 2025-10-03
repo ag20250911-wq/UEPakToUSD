@@ -126,8 +126,7 @@ internal class Program
                 {
                     foreach (var lod in obj33.LODModels)
                     {
-                        USkeletalMeshToUSD.Convert(obj33, dir + "\\");
-
+                        USkeletalMeshToUSD.ConvertToSplitUsd(obj33, dir + "\\");
                         break;
                         continue;
 
