@@ -51,7 +51,7 @@ using static System.Collections.Specialized.BitVector32;
 /// 
 /// 
 /// 
-/// bmp でテクスチャ保存してる
+/// png,tiff でテクスチャ保存してる
 /// SixLabors.ImageSharp
 /// デコードするのに
 /// BCnEncoder.Net

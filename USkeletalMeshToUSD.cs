@@ -1,4 +1,5 @@
 ﻿using BCnEncoder.Decoder;
+using BCnEncoder.Encoder;
 using BCnEncoder.Shared;
 using CUE4Parse.UE4.Assets;
 using CUE4Parse.UE4.Assets.Exports;
@@ -9,17 +10,19 @@ using CUE4Parse.UE4.Assets.Exports.Texture;
 using CUE4Parse.UE4.Objects.Core.Math;
 using CUE4Parse.UE4.Objects.RenderCore;
 using CUE4Parse.UE4.Objects.UObject;
+using CUE4Parse.Utils;
 using pxr;
 using SixLabors.ImageSharp;
+using SixLabors.ImageSharp.Formats;
+using SixLabors.ImageSharp.Formats.Tiff;
 using SixLabors.ImageSharp.PixelFormats;
 using System;
+using System.Collections;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Numerics;
-using System.Reflection;
 using System.Text;
-using static System.Collections.Specialized.BitVector32;
 
 public static class USkeletalMeshToUSD
 {
@@ -65,6 +68,9 @@ public static class USkeletalMeshToUSD
         if (skeletalMesh == null) throw new ArgumentNullException(nameof(skeletalMesh));
         if (string.IsNullOrEmpty(outputDirectory)) throw new ArgumentNullException(nameof(outputDirectory));
         Directory.CreateDirectory(outputDirectory);
+
+        
+        Console.WriteLine($"Wrote Geo USD: {skeletalMesh.Name}");
 
         var originalAssetName = skeletalMesh.Name ?? "UnnamedSkeletalMesh";
         var sanitizedPrimName = SanitizeUsdName(originalAssetName);
@@ -200,7 +206,6 @@ public static class USkeletalMeshToUSD
             // Jointのパス 一応持っておく
             usdSkin.CreateJointsAttr(usdBones);
 
-
             // BlendShape 存在する場合はプリム作成
             BlendShapeProcessor.ProcessBlendShapes(skeletalMesh, usdMesh);
 
@@ -226,7 +231,6 @@ public static class USkeletalMeshToUSD
                     var section = meshSections[sectionIndex];
 
                     var materialSlotName = skeletalMaterials.ElementAtOrDefault(section.MaterialIndex)?.MaterialSlotName.Text ?? $"mat_{section.MaterialIndex}";
-
 
                     var sanitizedSubsetName = SanitizeUsdName(materialSlotName);
                     var subsetFaceIndices = new VtIntArray();
@@ -276,6 +280,8 @@ public static class USkeletalMeshToUSD
             }
             stage.GetRootLayer().Save();
         }
+
+        return;
     }
 
     // Skeleton用USDを書き出す（UsdSkelSkeleton とジョイントXform群を出力）
@@ -341,8 +347,6 @@ public static class USkeletalMeshToUSD
                 var usdXform = UsdGeomXform.Define(stage, jointFullPath);
                 usdXform.AddTransformOp().Set(localM);
                 usdXforms.Add(usdXform);
-
-                //UsdGeomCube.Define(stage, usdXform.GetPath().AppendChild(new TfToken("Cube"))).GetSizeAttr().Set(0.05);
             }
 
 
@@ -372,6 +376,8 @@ public static class USkeletalMeshToUSD
 
             stage.GetRootLayer().Save();
         }
+
+        return;
     }
 
     // Root USD を作り、geo/skeleton を reference で取り込む（結果として一つの SkelRoot 配下に統合される）
@@ -424,6 +430,8 @@ public static class USkeletalMeshToUSD
 
         // 重要: root.usda に記述した reference は相対パスとして機能するように、
         // geoFilePath と skeletonFilePath を同じディレクトリに置いてください（ここではファイル名のみを参照に使っています）。
+
+        return;
     }
 
     private static int[] GetSourceIndices(FMultisizeIndexContainer indices)
@@ -456,6 +464,8 @@ public static class USkeletalMeshToUSD
             usdVertices[i] = new GfVec3f(transformedPos.X, transformedPos.Y, transformedPos.Z);
             usdNormals[i] = new GfVec3f(transformedNormal.X, transformedNormal.Y, transformedNormal.Z);
         }
+
+        return;
     }
 
     private static void ProcessSkinningData(FGPUVertFloat[] sourceVertices, FSkelMeshSection[] sections, out VtFloatArray usdBoneWeights, out VtIntArray usdBoneIndices, uint elementSize, List<int> usedBoneIndices, int numBones, bool optimizeBones)
@@ -536,6 +546,8 @@ public static class USkeletalMeshToUSD
                 }
             }
         }
+
+        return;
     }
 
     private static VtTokenArray BuildUsdBonePaths(FMeshBoneInfo[] boneInfo, List<int> usedBoneIndices)
@@ -565,235 +577,6 @@ public static class USkeletalMeshToUSD
         return usdBones;
     }
 
-}
-
-public static class UsdCoordinateTransformer
-{
-    public static Vector3 TransformPosition(FVector uePos)
-    {
-        // UE to USD mapping: USD(x, y, z) = UE(y, z, -x)
-        float usdX = uePos.Y;
-        float usdY = uePos.Z;
-        float usdZ = -uePos.X; // 左手座標系から右手座標系に
-
-        // -90° Y rotation: x' = -z, z' = x
-        float temp = usdX;
-        usdX = -usdZ; // x' = -(-uePos.X) = uePos.X
-        usdZ = temp;  // z' = uePos.Y
-
-        return new Vector3(usdX, usdY, usdZ);
-    }
-
-    public static Quaternion TransformRotation(FQuat ueRot)
-    {
-        var q_ue = new Quaternion(ueRot.X, ueRot.Y, ueRot.Z, ueRot.W);
-        var r_ue = Matrix4x4.CreateFromQuaternion(q_ue);
-
-        var T = new Matrix4x4(
-            0, 1, 0, 0,
-            0, 0, 1, 0,
-            -1, 0, 0, 0,
-            0, 0, 0, 1
-        );
-
-        var R_mat = new Matrix4x4(
-            0, 0, -1, 0,
-            0, 1, 0, 0,
-            1, 0, 0, 0,
-            0, 0, 0, 1
-        );
-
-        var M = Matrix4x4.Multiply(R_mat, T);
-
-        if (!Matrix4x4.Invert(M, out var invM))
-        {
-            throw new InvalidOperationException("Cannot invert coordinate transformation matrix.");
-        }
-
-        var r_usd = Matrix4x4.Multiply(M, Matrix4x4.Multiply(r_ue, invM));
-        var q_usd = Quaternion.CreateFromRotationMatrix(r_usd);
-        return Quaternion.Normalize(q_usd);
-    }
-
-    // FPackedNormal用の公開メソッド
-    public static Vector3 TransformNormal(FPackedNormal ueNormal)
-    {
-        // 共通ロジックを呼び出す
-        return TransformNormalLogic(ueNormal.X, ueNormal.Y, ueNormal.Z);
-    }
-
-    // FVector用の公開メソッド
-    public static Vector3 TransformNormal(FVector ueNormal)
-    {
-        // 共通ロジックを呼び出す
-        return TransformNormalLogic(ueNormal.X, ueNormal.Y, ueNormal.Z);
-    }
-
-    private static Vector3 TransformNormalLogic(float ueNormalX, float ueNormalY, float ueNormalZ)
-    {
-        // UE to USD mapping: USD(x, y, z) = UE(y, z, -x)
-        float nX = ueNormalY;
-        float nY = ueNormalZ;
-        float nZ = -ueNormalX; // 左手座標系から右手座標系に
-
-        // -90° Y rotation: x' = -z, z' = x
-        float nTemp = nX;
-        nX = -nZ;
-        nZ = nTemp;
-
-        return Vector3.Normalize(new Vector3(nX, nY, nZ));
-    }
-}
-
-public static class UsdTextureExporter
-{
-    public static void ExportMaterialTextures(UMaterialInstanceConstant materialInstance, string outputDirectory)
-    {
-        if (materialInstance == null) return;
-
-        var materialDirectoryPath = Path.Combine(outputDirectory, USkeletalMeshToUSD.SanitizeUsdName(materialInstance.Name ?? "Material"));
-        Directory.CreateDirectory(materialDirectoryPath);
-
-        var decoder = new BcDecoder();
-
-        foreach (var textureParameter in materialInstance.TextureParameterValues ?? Enumerable.Empty<FTextureParameterValue>())
-        {
-            try
-            {
-                var resolvedObject = textureParameter.ParameterValue?.ResolvedObject;
-                if (resolvedObject == null) continue;
-
-                if (!resolvedObject.TryLoad(out UObject textureObject) || textureObject is not UTexture2D texture2D)
-                {
-                    continue;
-                }
-
-                if (texture2D.PlatformData?.VTData != null)
-                    continue; // Skip virtual textures
-
-                var mipMap = texture2D.GetFirstMip();
-                if (mipMap?.BulkData?.Data == null || mipMap.SizeX == 0 || mipMap.SizeY == 0) continue;
-
-                var compressedData = mipMap.BulkData.Data;
-                int width = mipMap.SizeX;
-                int height = mipMap.SizeY;
-
-                byte[] decodedPixelData = DecodeTextureData(decoder, texture2D, compressedData, width, height);
-
-                if (decodedPixelData == null) continue;
-
-                if (texture2D.IsTextureCube) continue;
-
-                var outputFilePath = Path.Combine(materialDirectoryPath, texture2D.Name) + (texture2D.IsHDR ? ".exr" : ".png");
-
-                SaveTextureImage(decodedPixelData, width, height, texture2D.IsHDR, outputFilePath);
-            }
-            catch (Exception ex)
-            {
-                Console.WriteLine($"Warning: Failed to export a texture parameter. {ex.Message}");
-            }
-        }
-    }
-
-    private static byte[] DecodeTextureData(BcDecoder decoder, UTexture2D texture2D, byte[] compressedData, int width, int height)
-    {
-        byte[] decodedPixelData = null;
-
-        switch (texture2D.Format)
-        {
-            case EPixelFormat.PF_B8G8R8A8:
-            case EPixelFormat.PF_G8:
-            case EPixelFormat.PF_FloatRGBA when texture2D.IsHDR:
-                decodedPixelData = compressedData;
-                break;
-            case EPixelFormat.PF_DXT1:
-                decodedPixelData = DecodeToBgra(decoder, compressedData, width, height, CompressionFormat.Bc1);
-                break;
-            case EPixelFormat.PF_DXT5:
-                decodedPixelData = DecodeToBgra(decoder, compressedData, width, height, CompressionFormat.Bc3);
-                break;
-            case EPixelFormat.PF_BC5:
-                decodedPixelData = DecodeToBgra(decoder, compressedData, width, height, CompressionFormat.Bc5);
-                if (texture2D.IsNormalMap && decodedPixelData != null)
-                {
-                    ReconstructNormalMapZChannel(decodedPixelData, width, height);
-                }
-                break;
-            case EPixelFormat.PF_BC7:
-                decodedPixelData = DecodeToBgra(decoder, compressedData, width, height, CompressionFormat.Bc7);
-                break;
-            default:
-                return null;
-        }
-
-        return decodedPixelData;
-    }
-
-    private static void SaveTextureImage(byte[] decodedPixelData, int width, int height, bool isHDR, string outputFilePath)
-    {
-        try
-        {
-            if (isHDR)
-            {
-                using (var image = Image.LoadPixelData<RgbaVector>(decodedPixelData, width, height))
-                {
-                    image.SaveAsPng(outputFilePath);
-                }
-            }
-            else
-            {
-                using (var image = Image.LoadPixelData<Bgra32>(decodedPixelData, width, height))
-                {
-                    image.SaveAsPng(outputFilePath);
-                }
-            }
-        }
-        catch (Exception ex)
-        {
-            Console.WriteLine($"Failed to save texture to '{outputFilePath}': {ex.Message}");
-        }
-    }
-
-    private static byte[] DecodeToBgra(BcDecoder decoder, byte[] compressedData, int width, int height, CompressionFormat format)
-    {
-        if (compressedData == null || compressedData.Length == 0) return null;
-        try
-        {
-            var decodedPixels = decoder.DecodeRaw(compressedData, width, height, format);
-            if (decodedPixels == null || decodedPixels.Length == 0) return null;
-
-            var bgraPixelData = new byte[decodedPixels.Length * 4];
-            for (int i = 0; i < decodedPixels.Length; i++)
-            {
-                var pixel = decodedPixels[i];
-                int offset = i * 4;
-                bgraPixelData[offset + 0] = pixel.b;
-                bgraPixelData[offset + 1] = pixel.g;
-                bgraPixelData[offset + 2] = pixel.r;
-                bgraPixelData[offset + 3] = pixel.a;
-            }
-            return bgraPixelData;
-        }
-        catch (Exception ex)
-        {
-            Console.WriteLine($"Error during texture decoding with format {format}: {ex.Message}");
-            return null;
-        }
-    }
-
-    private static void ReconstructNormalMapZChannel(byte[] bgraPixelData, int width, int height)
-    {
-        int pixelCount = width * height;
-        for (int i = 0; i < pixelCount; i++)
-        {
-            int offset = i * 4;
-            double normalX = (bgraPixelData[offset + 2] / 255.0) * 2.0 - 1.0; // Red
-            double normalY = (bgraPixelData[offset + 1] / 255.0) * 2.0 - 1.0; // Green
-            double zSquared = 1.0 - normalX * normalX - normalY * normalY;
-            double normalZ = Math.Sqrt(Math.Max(0.0, zSquared));
-            bgraPixelData[offset + 0] = (byte)(Math.Clamp(normalZ, 0.0, 1.0) * 255.0); // Blue
-        }
-    }
 }
 
 
@@ -894,14 +677,12 @@ public class BlendShapeProcessor
             var sanitizedName = USkeletalMeshToUSD.SanitizeUsdName(morphTarget.Name ?? "BlendShape");
             blendShapeNames.push_back(new TfToken(sanitizedName));
 
-            // UsdSkelBlendShape prim定義
+            // UsdSkelBlendShape Prim定義
             var blendShapePath = blendShapesScope.GetPath().AppendChild(new TfToken(sanitizedName));
             var usdBlendShape = UsdSkelBlendShape.Define(stage, blendShapePath);
 
             // MorphTargetDeltasからデータ取得
             var deltas = morphTarget.MorphLODModels?[0].Vertices ?? Array.Empty<FMorphTargetDelta>();
-
-
             if (deltas.Length == 0 && lodModel.MorphTargetVertexInfoBuffers != null)
             {
                 var buffer = lodModel.MorphTargetVertexInfoBuffers;
@@ -965,6 +746,393 @@ public class BlendShapeProcessor
             for (int i = 0; i < blendShapeNames.size(); i++) weights[i] = 0.0f;
             usdMesh.GetPrim().CreateAttribute(new TfToken("primvars:skel:blendShapeWeights"), SdfValueTypeNames.FloatArray).Set(weights);
         }
+
+        return;
+    }
+}
+
+public static class UsdCoordinateTransformer
+{
+    public static Vector3 TransformPosition(FVector uePos)
+    {
+        // UE to USD mapping: USD(x, y, z) = UE(y, z, -x)
+        float usdX = uePos.Y;
+        float usdY = uePos.Z;
+        float usdZ = -uePos.X; // 左手座標系から右手座標系に
+
+        // -90° Y rotation: x' = -z, z' = x
+        float temp = usdX;
+        usdX = -usdZ; // x' = -(-uePos.X) = uePos.X
+        usdZ = temp;  // z' = uePos.Y
+
+        return new Vector3(usdX, usdY, usdZ);
     }
 
+    public static Quaternion TransformRotation(FQuat ueRot)
+    {
+        var q_ue = new Quaternion(ueRot.X, ueRot.Y, ueRot.Z, ueRot.W);
+        var r_ue = Matrix4x4.CreateFromQuaternion(q_ue);
+
+        var T = new Matrix4x4(
+            0, 1, 0, 0,
+            0, 0, 1, 0,
+            -1, 0, 0, 0,
+            0, 0, 0, 1
+        );
+
+        var R_mat = new Matrix4x4(
+            0, 0, -1, 0,
+            0, 1, 0, 0,
+            1, 0, 0, 0,
+            0, 0, 0, 1
+        );
+
+        var M = Matrix4x4.Multiply(R_mat, T);
+
+        if (!Matrix4x4.Invert(M, out var invM))
+        {
+            throw new InvalidOperationException("Cannot invert coordinate transformation matrix.");
+        }
+
+        var r_usd = Matrix4x4.Multiply(M, Matrix4x4.Multiply(r_ue, invM));
+        var q_usd = Quaternion.CreateFromRotationMatrix(r_usd);
+        return Quaternion.Normalize(q_usd);
+    }
+
+    // FPackedNormal用の公開メソッド
+    public static Vector3 TransformNormal(FPackedNormal ueNormal)
+    {
+        // 共通ロジックを呼び出す
+        return TransformNormalLogic(ueNormal.X, ueNormal.Y, ueNormal.Z);
+    }
+
+    // FVector用の公開メソッド
+    public static Vector3 TransformNormal(FVector ueNormal)
+    {
+        // 共通ロジックを呼び出す
+        return TransformNormalLogic(ueNormal.X, ueNormal.Y, ueNormal.Z);
+    }
+
+    private static Vector3 TransformNormalLogic(float ueNormalX, float ueNormalY, float ueNormalZ)
+    {
+        // UE to USD mapping: USD(x, y, z) = UE(y, z, -x)
+        float nX = ueNormalY;
+        float nY = ueNormalZ;
+        float nZ = -ueNormalX; // 左手座標系から右手座標系に
+
+        // -90° Y rotation: x' = -z, z' = x
+        float nTemp = nX;
+        nX = -nZ;
+        nZ = nTemp;
+
+        return Vector3.Normalize(new Vector3(nX, nY, nZ));
+    }
+}
+
+public static class UsdTextureExporter
+{
+    public static void ExportMaterialTextures(UMaterialInstanceConstant materialInstance, string outputDirectory)
+    {
+        if (materialInstance == null) return;
+
+        var materialDirectoryPath = Path.Combine(outputDirectory, USkeletalMeshToUSD.SanitizeUsdName(materialInstance.Name ?? "Material"));
+        Directory.CreateDirectory(materialDirectoryPath);
+        string outputFilePath;
+        var decoder = new BcDecoder();
+
+        foreach (var textureParameter in materialInstance.TextureParameterValues ?? Enumerable.Empty<FTextureParameterValue>())
+        {
+            try
+            {
+                var resolvedObject = textureParameter.ParameterValue?.ResolvedObject;
+                if (resolvedObject == null) continue;
+
+                if (!resolvedObject.TryLoad(out UObject textureObject) || textureObject is not UTexture2D texture2D)
+                {
+                    continue;
+                }
+
+                // StreamingVirtualTexture
+                if (texture2D.PlatformData?.VTData != null)
+                {
+                    outputFilePath = Path.Combine(materialDirectoryPath, texture2D.Name) + (texture2D.IsHDR ? ".tiff" : ".png");
+                    VirtualTextureExporter.ExportVirtualTexture(decoder, texture2D, outputFilePath);
+
+                    continue;
+                }
+
+                var mipMap = texture2D.GetFirstMip();
+                if (mipMap?.BulkData?.Data == null || mipMap.SizeX == 0 || mipMap.SizeY == 0) continue;
+
+                var compressedData = mipMap.BulkData.Data;
+                int width = mipMap.SizeX;
+                int height = mipMap.SizeY;
+
+                byte[] decodedPixelData = DecodeTextureData(decoder, texture2D, compressedData, width, height);
+
+                if (decodedPixelData == null) continue;
+
+                if (texture2D.IsTextureCube) continue;
+
+                outputFilePath = Path.Combine(materialDirectoryPath, texture2D.Name) + (texture2D.IsHDR ? ".tiff" : ".png");
+                SaveTextureImage(decodedPixelData, width, height, texture2D.IsHDR, outputFilePath);
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Warning: Failed to export a texture parameter. {ex.Message}");
+            }
+        }
+
+        return;
+    }
+
+    public static byte[] DecodeTextureData(BcDecoder decoder, UTexture2D texture2D, byte[] compressedData, int width, int height)
+    {
+        byte[] decodedPixelData = null;
+
+        switch (texture2D.Format)
+        {
+            case EPixelFormat.PF_B8G8R8A8:
+            case EPixelFormat.PF_G8:
+            case EPixelFormat.PF_FloatRGBA when texture2D.IsHDR:
+                decodedPixelData = compressedData;
+                break;
+            case EPixelFormat.PF_DXT1:
+                decodedPixelData = DecodeToBgra(decoder, compressedData, width, height, CompressionFormat.Bc1);
+                break;
+            case EPixelFormat.PF_DXT5:
+                decodedPixelData = DecodeToBgra(decoder, compressedData, width, height, CompressionFormat.Bc3);
+                break;
+            case EPixelFormat.PF_BC5:
+                decodedPixelData = DecodeToBgra(decoder, compressedData, width, height, CompressionFormat.Bc5);
+                if (texture2D.IsNormalMap && decodedPixelData != null)
+                {
+                    ReconstructNormalMapZChannel(decodedPixelData, width, height);
+                }
+                break;
+            case EPixelFormat.PF_BC7:
+                decodedPixelData = DecodeToBgra(decoder, compressedData, width, height, CompressionFormat.Bc7);
+                break;
+            default:
+                return null;
+        }
+
+        return decodedPixelData;
+    }
+
+    public static void SaveTextureImage(byte[] decodedPixelData, int width, int height, bool isHDR, string outputFilePath)
+    {
+        try
+        {
+            if (isHDR)
+            {
+                var encoder = new TiffEncoder() { BitsPerPixel = TiffBitsPerPixel.Bit64 };
+                
+                using (var image = Image.LoadPixelData<RgbaVector>(decodedPixelData, width, height))
+                {
+                    image.SaveAsTiff(outputFilePath,encoder);
+                }
+            }
+            else
+            {
+                using (var image = Image.LoadPixelData<Bgra32>(decodedPixelData, width, height))
+                {
+                    image.SaveAsPng(outputFilePath);
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"Failed to save texture to '{outputFilePath}': {ex.Message}");
+        }
+
+        return;
+    }
+
+    private static byte[] DecodeToBgra(BcDecoder decoder, byte[] compressedData, int width, int height, CompressionFormat format)
+    {
+        if (compressedData == null || compressedData.Length == 0) return null;
+        try
+        {
+            var decodedPixels = decoder.DecodeRaw(compressedData, width, height, format);
+            if (decodedPixels == null || decodedPixels.Length == 0) return null;
+
+            var bgraPixelData = new byte[decodedPixels.Length * 4];
+            for (int i = 0; i < decodedPixels.Length; i++)
+            {
+                var pixel = decodedPixels[i];
+                int offset = i * 4;
+                bgraPixelData[offset + 0] = pixel.b;
+                bgraPixelData[offset + 1] = pixel.g;
+                bgraPixelData[offset + 2] = pixel.r;
+                bgraPixelData[offset + 3] = pixel.a;
+            }
+            return bgraPixelData;
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"Error during texture decoding with format {format}: {ex.Message}");
+            return null;
+        }
+
+        return null;
+    }
+
+    private static void ReconstructNormalMapZChannel(byte[] bgraPixelData, int width, int height)
+    {
+        int pixelCount = width * height;
+        for (int i = 0; i < pixelCount; i++)
+        {
+            int offset = i * 4;
+            double normalX = (bgraPixelData[offset + 2] / 255.0) * 2.0 - 1.0; // Red
+            double normalY = (bgraPixelData[offset + 1] / 255.0) * 2.0 - 1.0; // Green
+            double zSquared = 1.0 - normalX * normalX - normalY * normalY;
+            double normalZ = Math.Sqrt(Math.Max(0.0, zSquared));
+            bgraPixelData[offset + 0] = (byte)(Math.Clamp(normalZ, 0.0, 1.0) * 255.0); // Blue
+        }
+
+        return;
+    }
+}
+
+public static class VirtualTextureExporter
+{
+    public static void ExportVirtualTexture(BcDecoder decoder, UTexture2D texture2D, string outputFilePath)
+    {
+        if (texture2D.PlatformData?.VTData == null) return;
+
+        var vtData = texture2D.PlatformData.VTData;
+
+        // 最高品質のトップミップ（インデックス0）を使用
+        int mipIndex = 0;
+        uint chunkIndex = vtData.ChunkIndexPerMip[mipIndex];
+        var mipData = vtData.TileOffsetData[mipIndex];
+
+        // 基本寸法を抽出
+        int totalWidth = (int)vtData.Width;
+        int totalHeight = (int)vtData.Height;
+        int tileSize = (int)vtData.TileSize;
+        int borderSize = (int)vtData.TileBorderSize;
+        int numTilesX = (int)mipData.Width;
+        int numTilesY = (int)mipData.Height;
+
+        // 圧縮フォーマットに基づくタイルあたりのバイト数を計算
+        int bytesPerBlock = GetBytesPerBlock(texture2D.Format);
+        if (bytesPerBlock == 0)
+        {
+            Console.WriteLine($"未対応の圧縮フォーマット: {texture2D.Format}");
+            return;
+        }
+
+        bool isCompressed = bytesPerBlock > 0;
+        int paddedTileSize = tileSize + borderSize * 2;
+        int bytesPerTile;
+        if (isCompressed)
+        {
+            int blocksPerSide = paddedTileSize / 4;
+            bytesPerTile = blocksPerSide * blocksPerSide * bytesPerBlock;
+            Console.WriteLine($"タイルあたりのバイト数 (圧縮): {bytesPerTile}");
+        }
+        else
+        {
+            int bytesPerPixel = texture2D.IsHDR ? 16 : 4; // HDR (FloatRGBA) は16バイト、LDR (B8G8R8A8) は4バイト
+            bytesPerTile = paddedTileSize * paddedTileSize * bytesPerPixel;
+            Console.WriteLine($"タイルあたりのバイト数 (非圧縮): {bytesPerTile}");
+        }
+
+        // 最終画像バッファを準備 (RGBA, ピクセルあたり4バイト)
+        int finalBytesPerPixel = texture2D.IsHDR ? 16 : 4;
+        var finalImageData = new byte[totalWidth * totalHeight * finalBytesPerPixel];
+
+        // ミップのチャンクとベースオフセットを取得
+        var chunk = vtData.Chunks[chunkIndex];
+        long baseOffsetMip = vtData.BaseOffsetPerMip[chunkIndex];
+
+        // すべてのタイルを処理
+        for (int tileY = 0; tileY < numTilesY; tileY++)
+        {
+            for (int tileX = 0; tileX < numTilesX; tileX++)
+            {
+                // タイルのモートンエンコードされた仮想アドレスを計算
+                uint vAddress = MathUtils.MortonCode2((uint)tileX) | (MathUtils.MortonCode2((uint)tileY) << 1);
+
+                // ミップデータ内の相対タイルオフセットを取得
+                uint tileOffsetInMip = mipData.GetTileOffset(vAddress);
+                if (tileOffsetInMip == ~0u)
+                {
+                    // このタイルにデータなし; スキップ（必要に応じてデフォルト色で塗りつぶし可能）
+                    continue;
+                }
+
+                // チャンクデータ内の最終オフセットを計算
+                long finalOffset = baseOffsetMip + (long)tileOffsetInMip * bytesPerTile;
+                if (finalOffset + bytesPerTile > chunk.BulkData.Data.Length)
+                {
+                    Console.WriteLine($"エラー: タイル ({tileX}, {tileY}) のオフセットが範囲外");
+                    continue;
+                }
+
+                // 圧縮タイルデータを抽出
+                var tileData = new byte[bytesPerTile];
+                Array.Copy(chunk.BulkData.Data, finalOffset, tileData, 0, bytesPerTile);
+
+
+                // パッド付きタイルをデコード
+                byte[] decompressedPaddedTile;
+                if (bytesPerBlock > 0)
+                {
+                    decompressedPaddedTile = UsdTextureExporter.DecodeTextureData(decoder, texture2D, tileData, paddedTileSize, paddedTileSize);
+                }
+                else
+                {
+                    decompressedPaddedTile = tileData; // 非圧縮の場合、デコード不要
+                    // 注意: B8G8R8A8順はBgra32として保存に適合するため、スワップ不要
+                }
+                if (decompressedPaddedTile == null) continue;
+
+                // 中央部（境界なし）を最終画像にコピー
+                CopyTileToImage(decompressedPaddedTile, finalImageData, tileX, tileY, tileSize, borderSize, paddedTileSize, totalWidth, finalBytesPerPixel);
+            }
+        }
+
+        // アセンブルされた画像を保存
+        UsdTextureExporter.SaveTextureImage(finalImageData, totalWidth, totalHeight, texture2D.IsHDR, outputFilePath);
+
+        return;
+    }
+
+    private static int GetBytesPerBlock(EPixelFormat format)
+    {
+        return format switch
+        {
+            EPixelFormat.PF_DXT1 => 8,     // BC1
+            EPixelFormat.PF_DXT5 => 16,    // BC3
+            EPixelFormat.PF_BC5 => 16,
+            EPixelFormat.PF_BC7 => 16,
+            EPixelFormat.PF_BC6H => 16,    // ADDED: BC6H
+            EPixelFormat.PF_B8G8R8A8 => -1, // 非圧縮を示すフラグ
+            EPixelFormat.PF_FloatRGBA => -1, // 非圧縮を示すフラグ
+            _ => 0  // 未対応
+        };
+    }
+
+    private static void CopyTileToImage(byte[] sourceTile, byte[] destImage, int tileX, int tileY, int tileSize, int borderSize, int paddedTileSize, int totalWidth, int bytesPerPixel)
+    {
+        int destBaseX = tileX * tileSize;
+        int destBaseY = tileY * tileSize;
+        int copyRowBytes = tileSize * bytesPerPixel;
+
+        for (int y = 0; y < tileSize; y++)
+        {
+            int srcY = y + borderSize;
+            int destY = destBaseY + y;
+
+            int srcOffset = (srcY * paddedTileSize + borderSize) * bytesPerPixel;
+            int destOffset = (destY * totalWidth + destBaseX) * bytesPerPixel;
+
+            Array.Copy(sourceTile, srcOffset, destImage, destOffset, copyRowBytes);
+        }
+
+        return;
+    }
 }
