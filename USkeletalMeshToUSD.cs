@@ -97,7 +97,10 @@ public static class USkeletalMeshToUSD
             maxElementSize = Math.Max(maxElementSize, (uint)section.MaxBoneInfluences);
         }
         uint elementSize = maxElementSize;
-        ProcessSkinningData(sourceVertices, lodModel.Sections, out VtFloatArray usdBoneWeights, out VtIntArray usdBoneIndices, elementSize, usedBoneIndices, optimizeBones);
+
+
+        int numBones = skeletalMesh.ReferenceSkeleton.FinalRefBoneInfo.Length;
+        ProcessSkinningData(sourceVertices, lodModel.Sections, out VtFloatArray usdBoneWeights, out VtIntArray usdBoneIndices, elementSize, usedBoneIndices, numBones, optimizeBones);
 
         var usdBones = BuildUsdBonePaths(sourceBoneInfo, usedBoneIndices);
 
@@ -110,6 +113,7 @@ public static class USkeletalMeshToUSD
         // 3) Root ファイル作成（UsdSkelRoot を作り、geo/skeleton を reference で取り込む。さらに mesh -> skeleton の binding を作る）
         WriteRootUsd(rootFile, sanitizedPrimName, geoFile, skeletonFile);
 
+        return;
     }
 
     // 使用されているボーンインデックスを取得（ウェイトがあるボーンとその親をルートまで）
@@ -197,14 +201,13 @@ public static class USkeletalMeshToUSD
             usdSkin.CreateJointsAttr(usdBones);
 
 
-            // blendshape
-            foreach (var item in skeletalMesh.MorphTargets)
-            {
-
-            }
+            // BlendShape 存在する場合はプリム作成
+            BlendShapeProcessor.ProcessBlendShapes(skeletalMesh, usdMesh);
 
             var lodModel = skeletalMesh.LODModels[0];
             var outputDirectory = Path.GetDirectoryName(filePath);
+
+
 
 
             //ProcessSubsetsAndMaterials(usdMesh, lodModel, skeletalMesh, outputDirectory);
@@ -271,8 +274,6 @@ public static class USkeletalMeshToUSD
                 // サブセット処理中のエラーは無視し、処理を続行
                 Console.WriteLine($"Warning: Failed during subset creation. {ex.Message}");
             }
-
-
             stage.GetRootLayer().Save();
         }
     }
@@ -457,7 +458,7 @@ public static class USkeletalMeshToUSD
         }
     }
 
-    private static void ProcessSkinningData(FGPUVertFloat[] sourceVertices, FSkelMeshSection[] sections, out VtFloatArray usdBoneWeights, out VtIntArray usdBoneIndices, uint elementSize, List<int> usedBoneIndices, bool optimizeBones)
+    private static void ProcessSkinningData(FGPUVertFloat[] sourceVertices, FSkelMeshSection[] sections, out VtFloatArray usdBoneWeights, out VtIntArray usdBoneIndices, uint elementSize, List<int> usedBoneIndices, int numBones, bool optimizeBones)
     {
         usdBoneWeights = new VtFloatArray((uint)sourceVertices.Length * elementSize);
         usdBoneIndices = new VtIntArray((uint)sourceVertices.Length * elementSize);
@@ -489,7 +490,27 @@ public static class USkeletalMeshToUSD
                 {
                     usdBoneWeights[flatIndex] = vertex.Infs.BoneWeight[i] / 255.0f;
                     int localBoneIndex = vertex.Infs.BoneIndex[i];
+                    // データが不正
+                    if (localBoneIndex >= boneMap.Length)
+                    {
+                        usdBoneIndices[flatIndex] = 0;
+                        usdBoneWeights[flatIndex] = 0;
+                        flatIndex++;
+                        Console.WriteLine($"vertex.Infs.BoneIndex[{i}] -> '{localBoneIndex}': 不正なデータ");
+                        continue;
+                    }
+
                     int globalBoneIndex = boneMap[localBoneIndex]; // sourceBoneIndexMapのインデックスに相当するグローバルインデックスにマッピング
+
+                    // データが不正
+                    if (globalBoneIndex >= numBones)
+                    {
+                        usdBoneIndices[flatIndex] = 0;
+                        usdBoneWeights[flatIndex] = 0;
+                        flatIndex++;
+                        Console.WriteLine($"vertex.Infs.BoneIndex[{i}] -> '{localBoneIndex}': 不正なデータ");
+                        continue;
+                    }
 
                     // 最適化時はリマップされたインデックスを使う
                     if (optimizeBones && remapBoneIndex.TryGetValue(globalBoneIndex, out int remappedIndex))
@@ -594,12 +615,26 @@ public static class UsdCoordinateTransformer
         return Quaternion.Normalize(q_usd);
     }
 
+    // FPackedNormal用の公開メソッド
     public static Vector3 TransformNormal(FPackedNormal ueNormal)
     {
+        // 共通ロジックを呼び出す
+        return TransformNormalLogic(ueNormal.X, ueNormal.Y, ueNormal.Z);
+    }
+
+    // FVector用の公開メソッド
+    public static Vector3 TransformNormal(FVector ueNormal)
+    {
+        // 共通ロジックを呼び出す
+        return TransformNormalLogic(ueNormal.X, ueNormal.Y, ueNormal.Z);
+    }
+
+    private static Vector3 TransformNormalLogic(float ueNormalX, float ueNormalY, float ueNormalZ)
+    {
         // UE to USD mapping: USD(x, y, z) = UE(y, z, -x)
-        float nX = ueNormal.Y;
-        float nY = ueNormal.Z;
-        float nZ = -ueNormal.X; // 左手座標系から右手座標系に
+        float nX = ueNormalY;
+        float nY = ueNormalZ;
+        float nZ = -ueNormalX; // 左手座標系から右手座標系に
 
         // -90° Y rotation: x' = -z, z' = x
         float nTemp = nX;
@@ -759,4 +794,177 @@ public static class UsdTextureExporter
             bgraPixelData[offset + 0] = (byte)(Math.Clamp(normalZ, 0.0, 1.0) * 255.0); // Blue
         }
     }
+}
+
+
+public class BlendShapeProcessor
+{
+    private static FMorphTargetDelta[] ParseDeltasFromBuffer(FMorphTargetVertexInfoBuffers buffer, int morphIndex)
+    {
+        var allDeltas = new List<FMorphTargetDelta>();
+
+        // 1. このモーフターゲットが使用するバッチの範囲を特定する
+        uint startBatchIndex = buffer.BatchStartOffsetPerMorph[morphIndex];
+        uint numBatchesForMorph = buffer.BatchesPerMorph[morphIndex];
+        uint endBatchIndex = startBatchIndex + numBatchesForMorph;
+
+        // 2. 対応するバッチをすべてループする
+        for (uint batchIdx = startBatchIndex; batchIdx < endBatchIndex; batchIdx++)
+        {
+            FMorphTargetVertexInfo batchInfo = buffer.MorphData[batchIdx];
+
+            if (batchInfo.QuantizedDelta == null || batchInfo.QuantizedDelta.Length == 0) continue;
+
+            // 3. バッチ内の各頂点データをループする
+            foreach (FQuantizedDelta qDelta in batchInfo.QuantizedDelta)
+            {
+                // 4. 量子化された位置データをfloatのFVectorに復元（非量子化）する
+                //    式: result = (quantized_value + min_value) * precision
+
+                // PositionMinはint32なのでfloatにキャストが必要
+                float deltaX = (qDelta.Position.X + batchInfo.PositionMin.X) * buffer.PositionPrecision;
+                float deltaY = (qDelta.Position.Y + batchInfo.PositionMin.Y) * buffer.PositionPrecision;
+                float deltaZ = (qDelta.Position.Z + batchInfo.PositionMin.Z) * buffer.PositionPrecision;
+
+                var positionDelta = new FVector(deltaX, deltaY, deltaZ);
+
+                FPackedNormal packedTangent;
+                if (batchInfo.bTangents)
+                {
+                    // bTangentsがtrueの場合のみ計算を行う
+                    // 計算式は位置の復元と全く同じ
+                    float tangentDeltaX = (qDelta.TangentZ.X + batchInfo.TangentZMin.X) * buffer.TangentZPrecision;
+                    float tangentDeltaY = (qDelta.TangentZ.Y + batchInfo.TangentZMin.Y) * buffer.TangentZPrecision;
+                    float tangentDeltaZ = (qDelta.TangentZ.Z + batchInfo.TangentZMin.Z) * buffer.TangentZPrecision;
+
+                    var tZDeltat = new Vector3(tangentDeltaX, tangentDeltaY, tangentDeltaZ);
+                    var tNormalize = Vector3.Normalize(tZDeltat);  // Ensure unit length for normal;
+
+                    var tangentZDelta = new FVector(tNormalize.X, tNormalize.Y, tNormalize.Z);
+
+                    // FPackedNormalのバグのあるコンストラクタを避け、手動でパッキング処理を行う
+                    uint packedX = (uint)Math.Clamp(Math.Round((tangentZDelta.X + 1.0f) * 127.5f), 0, 255);
+                    uint packedY = (uint)Math.Clamp(Math.Round((tangentZDelta.Y + 1.0f) * 127.5f), 0, 255);
+                    uint packedZ = (uint)Math.Clamp(Math.Round((tangentZDelta.Z + 1.0f) * 127.5f), 0, 255);
+
+                    // 正しいビット演算で uint 型のデータを作成
+                    uint packedData = packedX | (packedY << 8) | (packedZ << 16);
+
+                    // uintを受け取るコンストラクタを使ってFPackedNormalインスタンスを生成
+                    packedTangent = new FPackedNormal(packedData);
+                }
+                else
+                {
+                    // No tangents: default to zero or skip
+                    packedTangent = new FPackedNormal(new FVector(0, 0, 0));
+                }
+
+                var delta = new FMorphTargetDelta(positionDelta, (FVector)packedTangent, qDelta.Index);
+                allDeltas.Add(delta);
+            }
+        }
+
+
+        return allDeltas.ToArray();
+    }
+
+    public static void ProcessBlendShapes(USkeletalMesh skeletalMesh, UsdGeomMesh usdMesh)
+    {
+        if (skeletalMesh.MorphTargets == null || skeletalMesh.MorphTargets.Length == 0)
+        {
+            return;
+        }
+
+        var lodModel = skeletalMesh.LODModels[0];
+        var morphVertexInfo = lodModel.MorphTargetVertexInfoBuffers;
+
+        // BlendShapes scopeを作成 (例: /Geo/BlendShapes)
+        var stage = usdMesh.GetPrim().GetStage();
+        var blendShapesScopePath = new SdfPath(USkeletalMeshToUSD.ScopePath + "/BlendShapes");
+        var blendShapesScope = UsdGeomScope.Define(stage, blendShapesScopePath);
+
+        // BlendShape名リスト
+        var blendShapeNames = new VtTokenArray();
+        int morphIndex = 0;
+        foreach (var morphItem in skeletalMesh.MorphTargets)
+        {
+            if (morphItem.ResolvedObject == null) continue;
+            if (!morphItem.ResolvedObject.TryLoad(out UObject obj) || obj is not UMorphTarget morphTarget) continue;
+
+            var sanitizedName = USkeletalMeshToUSD.SanitizeUsdName(morphTarget.Name ?? "BlendShape");
+            blendShapeNames.push_back(new TfToken(sanitizedName));
+
+            // UsdSkelBlendShape prim定義
+            var blendShapePath = blendShapesScope.GetPath().AppendChild(new TfToken(sanitizedName));
+            var usdBlendShape = UsdSkelBlendShape.Define(stage, blendShapePath);
+
+            // MorphTargetDeltasからデータ取得
+            var deltas = morphTarget.MorphLODModels?[0].Vertices ?? Array.Empty<FMorphTargetDelta>();
+
+
+            if (deltas.Length == 0 && lodModel.MorphTargetVertexInfoBuffers != null)
+            {
+                var buffer = lodModel.MorphTargetVertexInfoBuffers;
+
+                // バッファからデルタを解析
+                //deltas = ParseDeltasFromBuffer(buffer, morphItem.Index - 1);
+                deltas = ParseDeltasFromBuffer(buffer, morphIndex);
+            }
+            morphIndex++;
+
+            if (deltas.Length == 0) continue;
+
+            // offsets (position deltas)
+            var offsets = new VtVec3fArray((uint)deltas.Length);
+            // normalOffsets (if available)
+            var normalOffsets = new VtVec3fArray((uint)deltas.Length);
+            // pointIndices (affected vertex indices)
+            var pointIndices = new VtIntArray((uint)deltas.Length);
+
+            for (int i = 0; i < deltas.Length; i++)
+            {
+                var delta = deltas[i];
+                var ueDeltaPos = delta.PositionDelta * 0.01f; // Scale to meters
+                var transformedDeltaPos = UsdCoordinateTransformer.TransformPosition(ueDeltaPos);
+                //var transformedDeltaPos = ueDeltaPos;
+
+                offsets[i] = new GfVec3f(transformedDeltaPos.X, transformedDeltaPos.Y, transformedDeltaPos.Z);
+
+                // TangentZDelta as normal delta (assuming)
+                var ueNormalDelta = delta.TangentZDelta;
+                var transformedNormalDelta = UsdCoordinateTransformer.TransformNormal(ueNormalDelta);
+                normalOffsets[i] = new GfVec3f(transformedNormalDelta.X, transformedNormalDelta.Y, transformedNormalDelta.Z);
+
+                pointIndices[i] = (int)delta.SourceIdx;
+
+            }
+
+            usdBlendShape.CreateOffsetsAttr().Set(offsets);
+            usdBlendShape.CreateNormalOffsetsAttr().Set(normalOffsets);
+            usdBlendShape.CreatePointIndicesAttr().Set(pointIndices);
+        }
+
+        // MeshにblendShapesをbind
+        if (blendShapeNames.size() > 0)
+        {
+            var skelBinding = UsdSkelBindingAPI.Apply(usdMesh.GetPrim());
+            skelBinding.CreateBlendShapesAttr().Set(blendShapeNames);
+
+            // Set relationships to blend shape prims
+            var blendShapeTargetsRel = skelBinding.CreateBlendShapeTargetsRel();
+            for (int i = 0; i < blendShapeNames.size(); i++)
+            {
+                var name = blendShapeNames[i];
+
+                var targetPath = blendShapesScope.GetPath().AppendChild(name);
+                blendShapeTargetsRel.AddTarget(targetPath);
+            }
+
+            // Set default weights (all 0)
+            var weights = new VtFloatArray(blendShapeNames.size());
+            for (int i = 0; i < blendShapeNames.size(); i++) weights[i] = 0.0f;
+            usdMesh.GetPrim().CreateAttribute(new TfToken("primvars:skel:blendShapeWeights"), SdfValueTypeNames.FloatArray).Set(weights);
+        }
+    }
+
 }
