@@ -98,7 +98,7 @@ public static class USkeletalMeshToUSD
         List<int> usedBoneIndices = GetUsedBoneIndices(lodModel.Sections, sourceBoneInfo, optimizeBones);
 
         // 頂点/法線・スキニングデータを作成（メモリ表現）
-        ProcessVerticesAndNormals(sourceVertices, out VtVec3fArray usdVertices, out VtVec3fArray usdNormals);
+        ProcessVerticesAndNormals(sourceVertices, out VtVec3fArray usdVertices, out VtVec3fArray usdNormals, out VtVec2fArray usdUV0s, out VtVec2fArray usdUV1s);
 
         uint maxElementSize = 0;
         foreach (var section in lodModel.Sections)
@@ -114,7 +114,7 @@ public static class USkeletalMeshToUSD
         var usdBones = BuildUsdBonePaths(sourceBoneInfo, usedBoneIndices);
 
         // 1) Geo ファイル作成（ジオメトリ + スキン属性を含める。ただし Skeleton 参照はここでは付けない）
-        WriteGeoUsd(geoFile, sanitizedPrimName, originalAssetName, usdVertices, usdNormals, sourceIndices, usdBoneWeights, usdBoneIndices, usdBones, elementSize, skeletalMesh);
+        WriteGeoUsd(geoFile, sanitizedPrimName, originalAssetName, usdVertices, usdNormals, usdUV0s, usdUV1s, sourceIndices, usdBoneWeights, usdBoneIndices, usdBones, elementSize, skeletalMesh);
 
         // 2) Skeleton ファイル作成（スケルトン / ジョイントXform）
         WriteSkeletonUsd(skeletonFile, sanitizedPrimName, skeletalMesh, sourceBoneInfo, usdBones, usedBoneIndices);
@@ -160,7 +160,7 @@ public static class USkeletalMeshToUSD
     }
 
     // Geo用USDを書き出す（メッシュとスキンのattrsを持つが、Skeleton参照は持たない）
-    private static void WriteGeoUsd(string filePath, string primName, string originalAssetName, VtVec3fArray points, VtVec3fArray normals, int[] indices, VtFloatArray jointWeights, VtIntArray jointIndices, VtTokenArray usdBones, uint elementSize, USkeletalMesh skeletalMesh)
+    private static void WriteGeoUsd(string filePath, string primName, string originalAssetName, VtVec3fArray points, VtVec3fArray normals, VtVec2fArray usdUV0s, VtVec2fArray usdUV1s, int[] indices, VtFloatArray jointWeights, VtIntArray jointIndices, VtTokenArray usdBones, uint elementSize, USkeletalMesh skeletalMesh)
     {
         using (var stage = UsdStage.CreateNew(filePath))
         {
@@ -187,6 +187,18 @@ public static class USkeletalMeshToUSD
             usdMesh.CreateNormalsAttr().Set(normals);
             usdMesh.SetNormalsInterpolation(UsdGeomTokens.vertex);
 
+            // UV0
+            var primvarsAPI = new UsdGeomPrimvarsAPI(usdMesh.GetPrim());
+            var uvPrimvar = primvarsAPI.CreatePrimvar(new TfToken("st"), SdfValueTypeNames.TexCoord2fArray, UsdGeomTokens.vertex);
+            uvPrimvar.GetAttr().Set(usdUV0s);
+
+            // UV1 LightMap (st1) の設定 (存在する場合)
+            if (usdUV1s != null && usdUV1s.size() > 0)
+            {
+                var uv1Primvar = primvarsAPI.CreatePrimvar(new TfToken("st1"), SdfValueTypeNames.TexCoord2fArray, UsdGeomTokens.vertex);
+                uv1Primvar.GetAttr().Set(usdUV1s);
+            }
+
             var faceVertexIndices = new VtIntArray((uint)indices.Length);
             for (int i = 0; i < indices.Length; i++) faceVertexIndices[i] = indices[i];
             usdMesh.CreateFaceVertexIndicesAttr().Set(faceVertexIndices);
@@ -195,30 +207,9 @@ public static class USkeletalMeshToUSD
             for (int i = 0; i < triCount; i++) faceVertexCounts[i] = 3;
             usdMesh.CreateFaceVertexCountsAttr().Set(faceVertexCounts);
 
-            // スキニング属性（jointIndices / jointWeights）を頂点インターポレーションで付与
-            // UsdSkelBinding は Root 側で行う予定だが、indices/weights自体はメッシュ側に含めておく
-            var prim = usdMesh.GetPrim();
-
-            var usdSkin = UsdSkelBindingAPI.Apply(usdMesh.GetPrim());
-            // jointWeights
-            var jointWeightsAttr = usdSkin.CreateJointWeightsAttr(jointWeights);
-            jointWeightsAttr.SetMetadata(new TfToken("elementSize"), elementSize);
-            jointWeightsAttr.SetMetadata(new TfToken("interpolation"), UsdGeomTokens.vertex);
-            // jointIndices
-            var jointIndicesAttr = usdSkin.CreateJointIndicesAttr(jointIndices);
-            jointIndicesAttr.SetMetadata(new TfToken("elementSize"), elementSize);
-            jointIndicesAttr.SetMetadata(new TfToken("interpolation"), UsdGeomTokens.vertex);
-
-            // Jointのパス 一応持っておく
-            usdSkin.CreateJointsAttr(usdBones);
-
-            // BlendShape 存在する場合はプリム作成
-            BlendShapeProcessor.ProcessBlendShapes(skeletalMesh, usdMesh);
 
             var lodModel = skeletalMesh.LODModels[0];
             var outputDirectory = Path.GetDirectoryName(filePath);
-
-
 
 
             //ProcessSubsetsAndMaterials(usdMesh, lodModel, skeletalMesh, outputDirectory);
@@ -325,6 +316,10 @@ public static class USkeletalMeshToUSD
                             Console.WriteLine($"Warning: Failed to process material at index {section.MaterialIndex}. {ex.Message}");
                         }
                     }
+
+                    // サブセットにマテリアルをバインド
+                    var subsetBindingAPI = UsdShadeMaterialBindingAPI.Apply(subset.GetPrim());
+                    subsetBindingAPI.Bind(usdMaterial);
                 }
             }
             catch (Exception ex)
@@ -332,6 +327,27 @@ public static class USkeletalMeshToUSD
                 // サブセット処理中のエラーは無視し、処理を続行
                 Console.WriteLine($"Warning: Failed during subset creation. {ex.Message}");
             }
+
+
+            // スキニング属性（jointIndices / jointWeights）を頂点インターポレーションで付与
+            // UsdSkelBinding は Root 側で行う予定だが、indices/weights自体はメッシュ側に含めておく
+            var usdSkin = UsdSkelBindingAPI.Apply(usdMesh.GetPrim());
+            // jointWeights
+            var jointWeightsAttr = usdSkin.CreateJointWeightsAttr(jointWeights);
+            jointWeightsAttr.SetMetadata(new TfToken("elementSize"), elementSize);
+            jointWeightsAttr.SetMetadata(new TfToken("interpolation"), UsdGeomTokens.vertex);
+            // jointIndices
+            var jointIndicesAttr = usdSkin.CreateJointIndicesAttr(jointIndices);
+            jointIndicesAttr.SetMetadata(new TfToken("elementSize"), elementSize);
+            jointIndicesAttr.SetMetadata(new TfToken("interpolation"), UsdGeomTokens.vertex);
+
+            // Jointのパス 一応持っておく
+            usdSkin.CreateJointsAttr(usdBones);
+
+            // BlendShape 存在する場合はプリム作成
+            BlendShapeProcessor.ProcessBlendShapes(skeletalMesh, usdMesh);
+
+
             stage.GetRootLayer().Save();
         }
 
@@ -501,22 +517,31 @@ public static class USkeletalMeshToUSD
         return Array.Empty<int>();
     }
 
-    private static void ProcessVerticesAndNormals(FGPUVertFloat[] sourceVertices, out VtVec3fArray usdVertices, out VtVec3fArray usdNormals)
+    private static void ProcessVerticesAndNormals(FGPUVertFloat[] sourceVertices, out VtVec3fArray usdVertices, out VtVec3fArray usdNormals, out VtVec2fArray usdUV0s, out VtVec2fArray usdUV1s)
     {
         usdVertices = new VtVec3fArray((uint)sourceVertices.Length);
         usdNormals = new VtVec3fArray((uint)sourceVertices.Length);
+        usdUV0s = new VtVec2fArray((uint)sourceVertices.Length);
+        usdUV1s = new VtVec2fArray((uint)sourceVertices.Length);
 
         for (int i = 0; i < sourceVertices.Length; i++)
         {
             var vertex = sourceVertices[i];
             var uePos = vertex.Pos * 0.01f; // Scale to meters
             var ueNormal = vertex.Normal[2]; // 3つ目が法線
+            var ueUV0 = vertex.UV[0];
+            var ueUV1 = vertex.UV[1];
 
             var transformedPos = UsdCoordinateTransformer.TransformPosition(uePos);
             var transformedNormal = UsdCoordinateTransformer.TransformNormal(ueNormal);
+            var transformedUV0 = ueUV0;
+            var transformedUV1 = ueUV1;
+
 
             usdVertices[i] = new GfVec3f(transformedPos.X, transformedPos.Y, transformedPos.Z);
             usdNormals[i] = new GfVec3f(transformedNormal.X, transformedNormal.Y, transformedNormal.Z);
+            usdUV0s[i] = new GfVec2f(transformedUV0.U, 1.0f - transformedUV0.V); // UEのV座標は反転が必要な場合が多い
+            usdUV1s[i] = new GfVec2f(transformedUV1.U, 1.0f - transformedUV1.V); // 同上
         }
 
         return;

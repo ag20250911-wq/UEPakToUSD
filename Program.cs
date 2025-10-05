@@ -124,9 +124,20 @@ internal class Program
                 }
                 if (export is USkeletalMesh obj33)
                 {
+                    var objname = obj33.Name;
+                    if (File.Exists(dir + "\\done.txt"))
+                    {
+                        if (File.ReadAllLines(dir + "\\done.txt").Contains(objname))
+                            continue;
+                    }
+                    USkeletalMeshToUSD.ConvertToSplitUsd(obj33, dir + "\\");
+                    File.AppendAllText(dir + "\\done.txt", objname + "\n");
+                    continue;
+
                     foreach (var lod in obj33.LODModels)
                     {
-                        USkeletalMeshToUSD.ConvertToSplitUsd(obj33, dir + "\\");
+                        
+
                         break;
                         continue;
 
