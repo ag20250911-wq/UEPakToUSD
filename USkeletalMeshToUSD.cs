@@ -19,9 +19,11 @@ using SixLabors.ImageSharp.PixelFormats;
 using System;
 using System.Collections;
 using System.Collections.Generic;
+using System.Formats.Asn1;
 using System.IO;
 using System.Linq;
 using System.Numerics;
+using System.Reflection.PortableExecutable;
 using System.Text;
 
 public static class USkeletalMeshToUSD
@@ -29,6 +31,7 @@ public static class USkeletalMeshToUSD
     private const string OriginalNameAttribute = "UEOriginalName";
     private const string OriginalMaterialSlotNameAttribute = "UEOriginalMaterialSlotName";
     public static string ScopePath { get; set; } = "/Geo";
+    public static string ScopeMaterialsPath { get; set; } = "/Materials";
     public static string ScopeSkeletonPath { get; set; } = "/Skeleton";
     public static string ScopeSkeletonsXformPath { get; set; } = "/SkeletonsXform";
 
@@ -170,6 +173,9 @@ public static class USkeletalMeshToUSD
             var geoScope = UsdGeomScope.Define(stage, new SdfPath(ScopePath)); // e.g. /Geo
             stage.SetDefaultPrim(geoScope.GetPrim());
 
+            // マテリアル用のパス（ここでは /Materials としておく）
+            var materialsScope = UsdGeomScope.Define(stage, new SdfPath(ScopeMaterialsPath));
+
             var meshPath = geoScope.GetPath().AppendChild(new TfToken(primName));
             var usdMesh = UsdGeomMesh.Define(stage, meshPath);
             usdMesh.GetPrim().CreateAttribute(new TfToken(OriginalNameAttribute), SdfValueTypeNames.String).Set(originalAssetName);
@@ -254,6 +260,25 @@ public static class USkeletalMeshToUSD
                     );
                     subset.GetPrim().CreateAttribute(new TfToken(OriginalMaterialSlotNameAttribute), Sdf.SdfGetValueTypeString()).Set(materialSlotName);
 
+                    // USD マテリアルの定義
+                    var matScopePath = materialsScope.GetPath().AppendChild(new TfToken(sanitizedSubsetName));
+                    var usdMaterial = UsdShadeMaterial.Define(stage, matScopePath);
+                    var matPath = UsdShadeNodeGraph.Define(stage, usdMaterial.GetPath().AppendChild(new TfToken("UsdPreviewSurface"))).GetPath();
+                    //var matPath = UsdGeomScope.Define(stage, usdMaterial.GetPath().AppendChild(new TfToken("UsdPreviewSurface"))).GetPath();
+
+                    // PreviewSurface作成
+                    var pbrShader = UsdShadeShader.Define(stage, new SdfPath(matPath + "/UsdPreviewSurface"));
+                    pbrShader.CreateIdAttr().Set(new TfToken("UsdPreviewSurface"));
+                    // シェーダーの surface 出力をマテリアルの surfaceOutput に接続
+                    usdMaterial.CreateSurfaceOutput()
+                        .ConnectToSource(pbrShader.ConnectableAPI(), new TfToken("surface"));
+
+                    // st Reader
+                    var stReader = UsdShadeShader.Define(stage, matPath.AppendChild(new TfToken("texCoordReader")));
+                    stReader.CreateIdAttr(new TfToken("UsdPrimvarReader_float2"));
+                    stReader.CreateInput(new TfToken("varname"), SdfValueTypeNames.String).Set("st");
+                    
+
 
                     // マテリアルが存在すればテクスチャをエクスポート
                     if (section.MaterialIndex >= 0 && section.MaterialIndex < materialInterfaces.Length)
@@ -263,7 +288,36 @@ public static class USkeletalMeshToUSD
                             var materialObject = materialInterfaces[section.MaterialIndex];
                             if (materialObject != null && materialObject.TryLoad(out UObject loadedMaterialObject) && loadedMaterialObject is UMaterialInstanceConstant materialInstance)
                             {
-                                UsdTextureExporter.ExportMaterialTextures(materialInstance, outputDirectory);
+                                var exportedTextures = UsdTextureExporter.ExportMaterialTextures(materialInstance, outputDirectory);
+                                // BaseColor が存在すれば diffuse に接続
+                                if (exportedTextures.TryGetValue("BaseColor", out string baseColorPath))
+                                {
+                                    var texShader = UsdShadeShader.Define(stage, new SdfPath(matPath + "/diffuseTexture"));
+                                    texShader.CreateIdAttr().Set(new TfToken("UsdUVTexture"));
+                                    texShader.CreateInput(new TfToken("file"), SdfValueTypeNames.Asset).Set(new SdfAssetPath(baseColorPath));
+                                    texShader.CreateInput(new TfToken("st"), SdfValueTypeNames.Float2).ConnectToSource(stReader.ConnectableAPI(), new TfToken("result"));
+
+                                    texShader.CreateOutput(new TfToken("rgb"), SdfValueTypeNames.Float3);
+                                    texShader.CreateOutput(new TfToken("a"), SdfValueTypeNames.Float);
+
+                                    // USDPreviewSurface に diffuseColor インプットを作成してUsdUVTextureを接続
+                                    pbrShader.CreateInput(new TfToken("diffuseColor"), SdfValueTypeNames.Color3f).ConnectToSource(texShader.ConnectableAPI(), new TfToken("rgb"));
+                                }
+
+                                // Normal が存在すれば normal に接続
+                                if (exportedTextures.TryGetValue("BaseNormal", out string normalTexPath))
+                                {
+                                    var texShader = UsdShadeShader.Define(stage, new SdfPath(matPath + "/normalTexture"));
+                                    texShader.CreateIdAttr(new TfToken("UsdUVTexture"));
+                                    texShader.CreateInput(new TfToken("file"), SdfValueTypeNames.Asset).Set(new SdfAssetPath(normalTexPath));
+                                    texShader.CreateInput(new TfToken("st"), SdfValueTypeNames.Float2)
+                                        .ConnectToSource(stReader.ConnectableAPI(), new TfToken("result"));
+                                    texShader.CreateOutput(new TfToken("rgb"), SdfValueTypeNames.Float3);
+                                    texShader.CreateOutput(new TfToken("a"), SdfValueTypeNames.Float);
+
+                                    // USDPreviewSurface に normal インプットを作成してUsdUVTextureを接続
+                                    pbrShader.CreateInput(new TfToken("normal"), SdfValueTypeNames.Normal3f).ConnectToSource(texShader.ConnectableAPI(), new TfToken("rgb"));
+                                }
                             }
                         }
                         catch (Exception ex)
@@ -831,9 +885,10 @@ public static class UsdCoordinateTransformer
 
 public static class UsdTextureExporter
 {
-    public static void ExportMaterialTextures(UMaterialInstanceConstant materialInstance, string outputDirectory)
+    public static Dictionary<string, string> ExportMaterialTextures(UMaterialInstanceConstant materialInstance, string outputDirectory)
     {
-        if (materialInstance == null) return;
+        var result = new Dictionary<string, string>();
+        if (materialInstance == null) return result;
 
         var materialDirectoryPath = Path.Combine(outputDirectory, USkeletalMeshToUSD.SanitizeUsdName(materialInstance.Name ?? "Material"));
         Directory.CreateDirectory(materialDirectoryPath);
@@ -857,7 +912,8 @@ public static class UsdTextureExporter
                 {
                     outputFilePath = Path.Combine(materialDirectoryPath, texture2D.Name) + (texture2D.IsHDR ? ".tiff" : ".png");
                     VirtualTextureExporter.ExportVirtualTexture(decoder, texture2D, outputFilePath);
-
+                    // 保存したテクスチャのパスを辞書に登録
+                    result[textureParameter.ParameterInfo.Name.PlainText] = outputFilePath;
                     continue;
                 }
 
@@ -876,6 +932,8 @@ public static class UsdTextureExporter
 
                 outputFilePath = Path.Combine(materialDirectoryPath, texture2D.Name) + (texture2D.IsHDR ? ".tiff" : ".png");
                 SaveTextureImage(decodedPixelData, width, height, texture2D.IsHDR, outputFilePath);
+                // 保存したテクスチャのパスを辞書に登録
+                result[textureParameter.ParameterInfo.Name.PlainText] = outputFilePath;
             }
             catch (Exception ex)
             {
@@ -883,7 +941,7 @@ public static class UsdTextureExporter
             }
         }
 
-        return;
+        return result;
     }
 
     public static byte[] DecodeTextureData(BcDecoder decoder, UTexture2D texture2D, byte[] compressedData, int width, int height)
