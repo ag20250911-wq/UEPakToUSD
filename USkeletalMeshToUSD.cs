@@ -25,11 +25,14 @@ using System.Linq;
 using System.Numerics;
 using System.Reflection.PortableExecutable;
 using System.Text;
+using System.Xml.Linq;
 
 public static class USkeletalMeshToUSD
 {
-    private const string OriginalNameAttribute = "UEOriginalName";
-    private const string OriginalMaterialSlotNameAttribute = "UEOriginalMaterialSlotName";
+    private const string OriginalNameAttribute = "ue:originalName";
+    private const string OriginalMaterialSlotNameAttribute = "ue:originalMaterialSlotName";
+    public static float UeToUsdScale = 0.01f; // UE units to meters
+
     public static string ScopePath { get; set; } = "/Geo";
     public static string ScopeMaterialsPath { get; set; } = "/Materials";
     public static string ScopeSkeletonPath { get; set; } = "/Skeleton";
@@ -72,16 +75,37 @@ public static class USkeletalMeshToUSD
         if (string.IsNullOrEmpty(outputDirectory)) throw new ArgumentNullException(nameof(outputDirectory));
         Directory.CreateDirectory(outputDirectory);
 
-        
+
         Console.WriteLine($"Wrote Geo USD: {skeletalMesh.Name}");
 
         var originalAssetName = skeletalMesh.Name ?? "UnnamedSkeletalMesh";
         var sanitizedPrimName = SanitizeUsdName(originalAssetName);
 
-        // ファイル名
-        var geoFile = Path.Combine(outputDirectory, sanitizedPrimName + "_geo.usda");
-        var skeletonFile = Path.Combine(outputDirectory, sanitizedPrimName + "_skeleton.usda");
-        var rootFile = Path.Combine(outputDirectory, sanitizedPrimName + "_root.usda");
+        // ルートディレクトリを作成: outputDirectory/CharacterName/
+        var rootDir = Path.Combine(outputDirectory, sanitizedPrimName);
+        Directory.CreateDirectory(rootDir);
+
+        // Geoディレクトリ: outputDirectory/CharacterName/Geo/
+        var geoDir = Path.Combine(rootDir, "Geo");
+        Directory.CreateDirectory(geoDir);
+
+        // Materialsディレクトリ: outputDirectory/CharacterName/Geo/Materials/
+        var materialsDir = Path.Combine(geoDir, "Materials");
+        Directory.CreateDirectory(materialsDir);
+
+        // Skelディレクトリ: outputDirectory/CharacterName/Skel/
+        var skelDir = Path.Combine(rootDir, "Skel");
+        Directory.CreateDirectory(skelDir);
+
+        // Animsディレクトリ (オプション、将来のアニメーション用): outputDirectory/CharacterName/Skel/Anims/
+        var animsDir = Path.Combine(skelDir, "Anims");
+        Directory.CreateDirectory(animsDir);
+
+        // ファイルパス
+        var geoFile = Path.Combine(geoDir, sanitizedPrimName + "_geo.usda");
+        var skeletonFile = Path.Combine(skelDir, sanitizedPrimName + "_skeleton.usda");
+        //var rootFile = Path.Combine(rootDir, sanitizedPrimName + "_root.usda");
+        var rootFile = Path.Combine(rootDir, sanitizedPrimName + ".usda");
 
         // LODチェック
         if (skeletalMesh.LODModels == null || skeletalMesh.LODModels.Length == 0) return;
@@ -98,7 +122,7 @@ public static class USkeletalMeshToUSD
         List<int> usedBoneIndices = GetUsedBoneIndices(lodModel.Sections, sourceBoneInfo, optimizeBones);
 
         // 頂点/法線・スキニングデータを作成（メモリ表現）
-        ProcessVerticesAndNormals(sourceVertices, out VtVec3fArray usdVertices, out VtVec3fArray usdNormals, out VtVec2fArray usdUV0s, out VtVec2fArray usdUV1s);
+        ProcessVerticesAndNormals(sourceVertices, out VtVec3fArray usdVertices, out VtVec3fArray usdNormals, out List<VtVec2fArray> usdUVs);
 
         uint maxElementSize = 0;
         foreach (var section in lodModel.Sections)
@@ -114,13 +138,13 @@ public static class USkeletalMeshToUSD
         var usdBones = BuildUsdBonePaths(sourceBoneInfo, usedBoneIndices);
 
         // 1) Geo ファイル作成（ジオメトリ + スキン属性を含める。ただし Skeleton 参照はここでは付けない）
-        WriteGeoUsd(geoFile, sanitizedPrimName, originalAssetName, usdVertices, usdNormals, usdUV0s, usdUV1s, sourceIndices, usdBoneWeights, usdBoneIndices, usdBones, elementSize, skeletalMesh);
+        WriteGeoUsd(geoFile, sanitizedPrimName, originalAssetName, usdVertices, usdNormals, usdUVs, sourceIndices, usdBoneWeights, usdBoneIndices, usdBones, elementSize, skeletalMesh, materialsDir);
 
         // 2) Skeleton ファイル作成（スケルトン / ジョイントXform）
         WriteSkeletonUsd(skeletonFile, sanitizedPrimName, skeletalMesh, sourceBoneInfo, usdBones, usedBoneIndices);
 
         // 3) Root ファイル作成（UsdSkelRoot を作り、geo/skeleton を reference で取り込む。さらに mesh -> skeleton の binding を作る）
-        WriteRootUsd(rootFile, sanitizedPrimName, geoFile, skeletonFile);
+        WriteRootUsd(rootFile, sanitizedPrimName, Path.GetRelativePath(rootDir, geoFile), Path.GetRelativePath(rootDir, skeletonFile));
 
         return;
     }
@@ -160,7 +184,7 @@ public static class USkeletalMeshToUSD
     }
 
     // Geo用USDを書き出す（メッシュとスキンのattrsを持つが、Skeleton参照は持たない）
-    private static void WriteGeoUsd(string filePath, string primName, string originalAssetName, VtVec3fArray points, VtVec3fArray normals, VtVec2fArray usdUV0s, VtVec2fArray usdUV1s, int[] indices, VtFloatArray jointWeights, VtIntArray jointIndices, VtTokenArray usdBones, uint elementSize, USkeletalMesh skeletalMesh)
+    private static void WriteGeoUsd(string filePath, string primName, string originalAssetName, VtVec3fArray points, VtVec3fArray normals, List<VtVec2fArray> usdUVs, int[] indices, VtFloatArray jointWeights, VtIntArray jointIndices, VtTokenArray usdBones, uint elementSize, USkeletalMesh skeletalMesh, string materialsDir)
     {
         using (var stage = UsdStage.CreateNew(filePath))
         {
@@ -173,7 +197,7 @@ public static class USkeletalMeshToUSD
             var geoScope = UsdGeomScope.Define(stage, new SdfPath(ScopePath)); // e.g. /Geo
             stage.SetDefaultPrim(geoScope.GetPrim());
 
-            // マテリアル用のパス（ここでは /Materials としておく）
+            // マテリアル用のパス（ここでは /Materials としておくが、別ファイル化のためGeo内ではreferenceで取り込む準備）
             var materialsScope = UsdGeomScope.Define(stage, new SdfPath(ScopeMaterialsPath));
 
             var meshPath = geoScope.GetPath().AppendChild(new TfToken(primName));
@@ -187,16 +211,15 @@ public static class USkeletalMeshToUSD
             usdMesh.CreateNormalsAttr().Set(normals);
             usdMesh.SetNormalsInterpolation(UsdGeomTokens.vertex);
 
-            // UV0
+            // UV0, UV1(LightMap), UV2... の設定
             var primvarsAPI = new UsdGeomPrimvarsAPI(usdMesh.GetPrim());
-            var uvPrimvar = primvarsAPI.CreatePrimvar(new TfToken("st"), SdfValueTypeNames.TexCoord2fArray, UsdGeomTokens.vertex);
-            uvPrimvar.GetAttr().Set(usdUV0s);
-
-            // UV1 LightMap (st1) の設定 (存在する場合)
-            if (usdUV1s != null && usdUV1s.size() > 0)
+            for (int i = 0; i < usdUVs.Count; i++)
             {
-                var uv1Primvar = primvarsAPI.CreatePrimvar(new TfToken("st1"), SdfValueTypeNames.TexCoord2fArray, UsdGeomTokens.vertex);
-                uv1Primvar.GetAttr().Set(usdUV1s);
+                var st = "st";
+                if (i != 0)
+                    st += i.ToString();
+                var uvPrimvar = primvarsAPI.CreatePrimvar(new TfToken(st), SdfValueTypeNames.TexCoord2fArray, UsdGeomTokens.vertex);
+                uvPrimvar.GetAttr().Set(usdUVs[i]);
             }
 
             var faceVertexIndices = new VtIntArray((uint)indices.Length);
@@ -209,10 +232,7 @@ public static class USkeletalMeshToUSD
 
 
             var lodModel = skeletalMesh.LODModels[0];
-            var outputDirectory = Path.GetDirectoryName(filePath);
 
-
-            //ProcessSubsetsAndMaterials(usdMesh, lodModel, skeletalMesh, outputDirectory);
             // --- サブセット（マテリアルごとのグループ）とマテリアルの処理 ---
             try
             {
@@ -251,75 +271,24 @@ public static class USkeletalMeshToUSD
                     );
                     subset.GetPrim().CreateAttribute(new TfToken(OriginalMaterialSlotNameAttribute), Sdf.SdfGetValueTypeString()).Set(materialSlotName);
 
-                    // USD マテリアルの定義
-                    var matScopePath = materialsScope.GetPath().AppendChild(new TfToken(sanitizedSubsetName));
-                    var usdMaterial = UsdShadeMaterial.Define(stage, matScopePath);
-                    var matPath = UsdShadeNodeGraph.Define(stage, usdMaterial.GetPath().AppendChild(new TfToken("UsdPreviewSurface"))).GetPath();
-                    //var matPath = UsdGeomScope.Define(stage, usdMaterial.GetPath().AppendChild(new TfToken("UsdPreviewSurface"))).GetPath();
+                    // マテリアル専用のディレクトリを作成: Geo/Materials/MatN/
+                    var matDir = Path.Combine(materialsDir, sanitizedSubsetName);
+                    Directory.CreateDirectory(matDir);
 
-                    // PreviewSurface作成
-                    var pbrShader = UsdShadeShader.Define(stage, new SdfPath(matPath + "/UsdPreviewSurface"));
-                    pbrShader.CreateIdAttr().Set(new TfToken("UsdPreviewSurface"));
-                    // シェーダーの surface 出力をマテリアルの surfaceOutput に接続
-                    usdMaterial.CreateSurfaceOutput()
-                        .ConnectToSource(pbrShader.ConnectableAPI(), new TfToken("surface"));
+                    // マテリアル専用のUSDファイルパス: Geo/Materials/MatN/MatN.usd
+                    var matFilePath = Path.Combine(matDir, sanitizedSubsetName + "_material.usda");
 
-                    // st Reader
-                    var stReader = UsdShadeShader.Define(stage, matPath.AppendChild(new TfToken("texCoordReader")));
-                    stReader.CreateIdAttr(new TfToken("UsdPrimvarReader_float2"));
-                    stReader.CreateInput(new TfToken("varname"), SdfValueTypeNames.String).Set("st");
-                    
+                    // マテリアルを別ファイルに書き出す
+                    WriteMaterialUsd(matFilePath, sanitizedSubsetName, section, materialInterfaces, matDir, skeletalMesh, materialSlotName);
 
-
-                    // マテリアルが存在すればテクスチャをエクスポート
-                    if (section.MaterialIndex >= 0 && section.MaterialIndex < materialInterfaces.Length)
-                    {
-                        try
-                        {
-                            var materialObject = materialInterfaces[section.MaterialIndex];
-                            if (materialObject != null && materialObject.TryLoad(out UObject loadedMaterialObject) && loadedMaterialObject is UMaterialInstanceConstant materialInstance)
-                            {
-                                var exportedTextures = UsdTextureExporter.ExportMaterialTextures(materialInstance, outputDirectory);
-                                // BaseColor が存在すれば diffuse に接続
-                                if (exportedTextures.TryGetValue("BaseColor", out string baseColorPath))
-                                {
-                                    var texShader = UsdShadeShader.Define(stage, new SdfPath(matPath + "/diffuseTexture"));
-                                    texShader.CreateIdAttr().Set(new TfToken("UsdUVTexture"));
-                                    texShader.CreateInput(new TfToken("file"), SdfValueTypeNames.Asset).Set(new SdfAssetPath(baseColorPath));
-                                    texShader.CreateInput(new TfToken("st"), SdfValueTypeNames.Float2).ConnectToSource(stReader.ConnectableAPI(), new TfToken("result"));
-
-                                    texShader.CreateOutput(new TfToken("rgb"), SdfValueTypeNames.Float3);
-                                    texShader.CreateOutput(new TfToken("a"), SdfValueTypeNames.Float);
-
-                                    // USDPreviewSurface に diffuseColor インプットを作成してUsdUVTextureを接続
-                                    pbrShader.CreateInput(new TfToken("diffuseColor"), SdfValueTypeNames.Color3f).ConnectToSource(texShader.ConnectableAPI(), new TfToken("rgb"));
-                                }
-
-                                // Normal が存在すれば normal に接続
-                                if (exportedTextures.TryGetValue("BaseNormal", out string normalTexPath))
-                                {
-                                    var texShader = UsdShadeShader.Define(stage, new SdfPath(matPath + "/normalTexture"));
-                                    texShader.CreateIdAttr(new TfToken("UsdUVTexture"));
-                                    texShader.CreateInput(new TfToken("file"), SdfValueTypeNames.Asset).Set(new SdfAssetPath(normalTexPath));
-                                    texShader.CreateInput(new TfToken("st"), SdfValueTypeNames.Float2)
-                                        .ConnectToSource(stReader.ConnectableAPI(), new TfToken("result"));
-                                    texShader.CreateOutput(new TfToken("rgb"), SdfValueTypeNames.Float3);
-                                    texShader.CreateOutput(new TfToken("a"), SdfValueTypeNames.Float);
-
-                                    // USDPreviewSurface に normal インプットを作成してUsdUVTextureを接続
-                                    pbrShader.CreateInput(new TfToken("normal"), SdfValueTypeNames.Normal3f).ConnectToSource(texShader.ConnectableAPI(), new TfToken("rgb"));
-                                }
-                            }
-                        }
-                        catch (Exception ex)
-                        {
-                            Console.WriteLine($"Warning: Failed to process material at index {section.MaterialIndex}. {ex.Message}");
-                        }
-                    }
+                    // Geo USD内でマテリアルのreferenceを追加
+                    var matRefPath = new SdfPath(ScopeMaterialsPath).AppendChild(new TfToken(sanitizedSubsetName));
+                    var usdMaterialPrim = stage.DefinePrim(matRefPath);
+                    usdMaterialPrim.GetReferences().AddReference(new SdfReference(Path.GetRelativePath(Path.GetDirectoryName(filePath), matFilePath), new SdfPath("/" + sanitizedSubsetName)));
 
                     // サブセットにマテリアルをバインド
                     var subsetBindingAPI = UsdShadeMaterialBindingAPI.Apply(subset.GetPrim());
-                    subsetBindingAPI.Bind(usdMaterial);
+                    subsetBindingAPI.Bind(new UsdShadeMaterial(usdMaterialPrim));
                 }
             }
             catch (Exception ex)
@@ -352,6 +321,243 @@ public static class USkeletalMeshToUSD
         }
 
         return;
+    }
+
+    private static void WriteMaterialUsd(string matFilePath, string sanitizedSubsetName, FSkelMeshSection section, ResolvedObject[] materialInterfaces, string matDir, USkeletalMesh skeletalMesh, string originalMaterialSlotName)
+    {
+        using (var matStage = UsdStage.CreateNew(matFilePath))
+        {
+            if (matStage == null) throw new InvalidOperationException($"Failed to create Material USD: {matFilePath}");
+
+            UsdGeom.UsdGeomSetStageUpAxis(matStage, UsdGeomTokens.y);
+            UsdGeom.UsdGeomSetStageMetersPerUnit(matStage, 1);
+
+            // マテリアルPrimを定義
+            var usdMaterial = UsdShadeMaterial.Define(matStage, new SdfPath("/" + sanitizedSubsetName));
+            matStage.SetDefaultPrim(usdMaterial.GetPrim());
+
+            usdMaterial.GetPrim().CreateAttribute(new TfToken(OriginalMaterialSlotNameAttribute), SdfValueTypeNames.String).Set(originalMaterialSlotName);
+
+            var matPath = usdMaterial.GetPath().AppendChild(new TfToken("UsdPreviewSurface"));
+
+            // PreviewSurface作成
+            var pbrShader = UsdShadeShader.Define(matStage, new SdfPath(matPath + "/UsdPreviewSurface"));
+            pbrShader.CreateIdAttr().Set(new TfToken("UsdPreviewSurface"));
+            // シェーダーの surface 出力をマテリアルの surfaceOutput に接続
+            usdMaterial.CreateSurfaceOutput()
+                .ConnectToSource(pbrShader.ConnectableAPI(), new TfToken("surface"));
+
+            // st Reader
+            var stReader = UsdShadeShader.Define(matStage, matPath.AppendChild(new TfToken("texCoordReader")));
+            stReader.CreateIdAttr(new TfToken("UsdPrimvarReader_float2"));
+            stReader.CreateInput(new TfToken("varname"), SdfValueTypeNames.String).Set("st");
+
+            // マテリアルが存在すればテクスチャをエクスポート
+            if (section.MaterialIndex >= 0 && section.MaterialIndex < materialInterfaces.Length)
+            {
+                try
+                {
+                    var materialObject = materialInterfaces[section.MaterialIndex];
+                    if (materialObject != null && materialObject.TryLoad(out UObject loadedMaterialObject) && loadedMaterialObject is UMaterialInstanceConstant materialInstance)
+                    {
+                        var exportedTextures = UsdTextureExporter.ExportMaterialTextures(materialInstance, matDir); // matDirにエクスポート
+
+                        // exportedTexturesの値を相対パスに変換
+                        var relativeTextures = exportedTextures.ToDictionary(
+                            kv => kv.Key,
+                            kv => "./Textures/" + Path.GetFileName(kv.Value)
+                        );
+
+                        // relativeTexturesをファイルに保存（例: JSON形式でデバッグ用）
+                        var texturesFilePath = Path.Combine(matDir, "exportedTextures.json");
+                        File.WriteAllText(texturesFilePath, Newtonsoft.Json.JsonConvert.SerializeObject(relativeTextures, Newtonsoft.Json.Formatting.Indented));
+
+                        // テクスチャ接続をリファクタリングしたメソッドで処理
+                        ConnectTexturesToShader(matStage, matPath, pbrShader, stReader, exportedTextures, matDir);
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine($"Warning: Failed to process material at index {section.MaterialIndex}. {ex.Message}");
+                }
+            }
+
+            matStage.GetRootLayer().Save();
+        }
+    }
+
+    private static void ConnectTexturesToShader(UsdStage matStage, SdfPath matPath, UsdShadeShader pbrShader, UsdShadeShader stReader, Dictionary<string, string> exportedTextures, string matDir)
+    {
+        // 接続されたテクスチャを追跡するための辞書（入力名 -> 相対パス）
+        var connectedTextures = new Dictionary<string, string>();
+
+        // テクスチャの可能なキー名をマッピング（大文字小文字のバリエーションを考慮）
+        var textureMappings = new Dictionary<string, string[]>
+    {
+        { "diffuseColor", new[] { "BaseColor", "Albedo", "basecolor", "Base Color", "BaseColorTexture", "DiffuseMap", "Basecolor", "BaseColor/Opacity", "IrisColor" } },
+        { "normal", new[] { "BaseNormal", "Normal", "NormalMap", "NormalTexture", "ObjNormal" } },
+        { "emissiveColor", new[] { "Emissive", "EmissiveColor", "EmissiveMap", "Emission" } },
+        { "roughness", new[] { "Roughness", "RoughnessMap" } },
+        { "metallic", new[] { "Metallic", "MetallicMap", "Metalness" } },
+        { "specularColor", new[] { "Specular", "SpecularMap", "ScleraColor" } },
+        { "clearcoat", new[] { "Clearcoat", "ClearcoatMap" } },
+        { "clearcoatRoughness", new[] { "ClearcoatRoughness", "ClearcoatRoughnessMap" } },
+        { "opacity", new[] { "Opacity", "OpacityMap", "Alpha" } },
+        { "occlusion", new[] { "Occlusion", "OcclusionMap", "AmbientOcclusion" } },
+        { "displacement", new[] { "Displacement", "DisplacementMap", "HeightMap" } }
+    };
+
+        // パックされたテクスチャのサポート（例: MRO - Metallic in B, Roughness in G, Occlusion in R など、Unrealの標準に合わせて調整）
+        // ここでは一般的なGLTFスタイルを仮定: MetallicRoughnessテクスチャで B=Metallic, G=Roughness, R=Occlusion (オプション)
+        // SASRや他のパック形式も同様に扱えるよう拡張可能。実際のUnrealマテリアルに基づいてチャンネルを調整。
+        var packedTextureMappings = new Dictionary<string, (string[] keys, Dictionary<string, (string channel, string inputName)> channels)>
+    {
+        { "MRO", (new[] { "MRO", "MetallicRoughnessOcclusion", "PackedMRO" }, new Dictionary<string, (string, string)>
+            {
+                { "metallic", ("b", "metallic") },  // Blue channel for Metallic (GLTF standard)
+                { "roughness", ("g", "roughness") }, // Green for Roughness
+                { "occlusion", ("r", "occlusion") }  // Red for Occlusion
+            })
+        },
+        { "MRSO", (new[] { "MRSOTexture"}, new Dictionary<string, (string, string)>
+            {
+                { "metallic", ("r", "metallic") },
+                { "roughness", ("g", "roughness") }, // Roughness
+                { "occlusion", ("a", "occlusion") }  // Occlusion
+            })
+        },        
+        { "ORM", (new[] { "ORMTexture" , "OcclusionRoughnessMetalic" }, new Dictionary<string, (string, string)>
+            {
+                { "metallic", ("b", "metallic") },  // Blue channel for Metallic (GLTF standard)
+                { "roughness", ("g", "roughness") }, // Green for Roughness
+                { "occlusion", ("r", "occlusion") }  // Red for Occlusion
+            })
+        },
+        
+
+        // SASRの例（仮定: Subsurface in R, AmbientOcclusion in G, Specular in B, Roughness in A など。必要に応じて調整）
+        { "SASR", (new[] { "SASR", "SubsurfaceAmbientSpecularRoughness", "PackedSASR", "SASRTexture" }, new Dictionary<string, (string, string)>
+            {
+                // { "subsurface", ("r", "subsurface") }, // USD PreviewSurfaceにはsubsurfaceがないのでスキップまたは拡張
+                { "occlusion", ("g", "occlusion") },
+                { "specular", ("b", "specularLevel") }, // specularLevelにマップ（useSpecularWorkflow=1の場合）
+                { "roughness", ("a", "roughness") }
+            })
+        },
+        // FAMRの追加（仮定: Fuzziness in R (無視), AmbientOcclusion in G, Metallic in B, Roughness in A）
+        { "FAMR", (new[] { "FAMR", "FuzzAmbientMetallicRoughness", "PackedFAMR" , "COMRTexture" , "Metallic/Roughness/Specular" }, new Dictionary<string, (string, string)>
+            {
+                { "occlusion", ("g", "occlusion") },    // G: Ambient Occlusion
+                { "metallic", ("b", "metallic") },      // B: Metallic
+                { "roughness", ("a", "roughness") }     // A: Roughness
+                // F (R: Fuzziness) は無視（USD PreviewSurfaceで直接サポートされていないため）
+            })
+        }
+        // 他のパック形式を追加可能
+    };
+
+        // 個別テクスチャの接続
+        foreach (var mapping in textureMappings)
+        {
+            string texturePath = null;
+            foreach (var key in mapping.Value)
+            {
+                if (exportedTextures.TryGetValue(key, out texturePath))
+                {
+                    break;
+                }
+            }
+
+            if (!string.IsNullOrEmpty(texturePath))
+            {
+                var relativePath = "./Textures/" + Path.GetFileName(texturePath);
+                ConnectSingleTexture(matStage, matPath, pbrShader, stReader, mapping.Key, texturePath, "rgb", mapping.Key);
+                connectedTextures[mapping.Key] = relativePath;
+            }
+        }
+
+        // パックされたテクスチャの接続
+        foreach (var packed in packedTextureMappings)
+        {
+            string packedTexturePath = null;
+            foreach (var key in packed.Value.keys)
+            {
+                if (exportedTextures.TryGetValue(key, out packedTexturePath))
+                {
+                    break;
+                }
+            }
+
+            if (!string.IsNullOrEmpty(packedTexturePath))
+            {
+                var relativePath = "./Textures/" + Path.GetFileName(packedTexturePath);
+
+                var shaderName = packed.Key + "Texture";
+                var texShader = UsdShadeShader.Define(matStage, new SdfPath(matPath + "/" + shaderName));
+                texShader.CreateIdAttr().Set(new TfToken("UsdUVTexture"));
+                texShader.CreateInput(new TfToken("file"), SdfValueTypeNames.Asset).Set(new SdfAssetPath("./Textures/" + Path.GetFileName(packedTexturePath)));
+                texShader.CreateInput(new TfToken("st"), SdfValueTypeNames.Float2).ConnectToSource(stReader.ConnectableAPI(), new TfToken("result"));
+
+                // 各チャンネルを出力として作成
+                texShader.CreateOutput(new TfToken("r"), SdfValueTypeNames.Float);
+                texShader.CreateOutput(new TfToken("g"), SdfValueTypeNames.Float);
+                texShader.CreateOutput(new TfToken("b"), SdfValueTypeNames.Float);
+                texShader.CreateOutput(new TfToken("a"), SdfValueTypeNames.Float);
+
+                // 各チャンネルを対応する入力に接続
+                foreach (var channelMap in packed.Value.channels)
+                {
+                    var outputName = channelMap.Value.channel;
+                    var inputName = channelMap.Value.inputName;
+                    pbrShader.CreateInput(new TfToken(inputName), GetSdfTypeForInput(inputName))
+                        .ConnectToSource(texShader.ConnectableAPI(), new TfToken(outputName));
+                    // パックテクスチャの場合、種類としてinputNameをキーとし、相対パスを値として記録（同じパスを複数に共有）
+                    connectedTextures[inputName] = relativePath + " (channel: " + outputName + ")";
+                }
+            }
+        }
+
+        // specularWorkflowの設定（metallicがある場合0、specularがある場合1）
+        bool hasMetallic = exportedTextures.Any(kv => textureMappings["metallic"].Contains(kv.Key) || packedTextureMappings.Values.Any(p => p.channels.ContainsKey("metallic")));
+        bool hasSpecular = exportedTextures.Any(kv => textureMappings["specularColor"].Contains(kv.Key) || packedTextureMappings.Values.Any(p => p.channels.ContainsKey("specular")));
+        pbrShader.CreateInput(new TfToken("useSpecularWorkflow"), SdfValueTypeNames.Int).Set(hasSpecular ? 1 : 0);
+
+        // 接続されたテクスチャをJSONファイルに出力
+        var connectedTexturesFilePath = Path.Combine(matDir, "connectedTextures.json");
+        File.WriteAllText(connectedTexturesFilePath, Newtonsoft.Json.JsonConvert.SerializeObject(connectedTextures, Newtonsoft.Json.Formatting.Indented));
+    }
+
+    private static void ConnectSingleTexture(UsdStage matStage, SdfPath matPath, UsdShadeShader pbrShader, UsdShadeShader stReader, string shaderSuffix, string texturePath, string outputName, string inputName)
+    {
+        var texShader = UsdShadeShader.Define(matStage, new SdfPath(matPath + "/" + shaderSuffix + "Texture"));
+        texShader.CreateIdAttr().Set(new TfToken("UsdUVTexture"));
+        texShader.CreateInput(new TfToken("file"), SdfValueTypeNames.Asset).Set(new SdfAssetPath("./Textures/" + Path.GetFileName(texturePath)));
+        texShader.CreateInput(new TfToken("st"), SdfValueTypeNames.Float2).ConnectToSource(stReader.ConnectableAPI(), new TfToken("result"));
+
+        texShader.CreateOutput(new TfToken(outputName), GetSdfTypeForOutput(outputName));
+
+        pbrShader.CreateInput(new TfToken(inputName), GetSdfTypeForInput(inputName))
+            .ConnectToSource(texShader.ConnectableAPI(), new TfToken(outputName));
+    }
+
+    private static SdfValueTypeName GetSdfTypeForInput(string inputName)
+    {
+        return inputName switch
+        {
+            "diffuseColor" or "emissiveColor" or "specularColor" => SdfValueTypeNames.Color3f,
+            "normal" => SdfValueTypeNames.Normal3f,
+            "displacement" => SdfValueTypeNames.Float3,
+            _ => SdfValueTypeNames.Float // metallic, roughness, etc.
+        };
+    }
+
+    private static SdfValueTypeName GetSdfTypeForOutput(string outputName)
+    {
+        return outputName switch
+        {
+            "rgb" => SdfValueTypeNames.Float3,
+            _ => SdfValueTypeNames.Float // r, g, b, a
+        };
     }
 
     // Skeleton用USDを書き出す（UsdSkelSkeleton とジョイントXform群を出力）
@@ -391,7 +597,7 @@ public static class USkeletalMeshToUSD
             {
                 int originalIndex = usedBoneIndices[i];
                 var item = skeletalMesh.ReferenceSkeleton.FinalRefBonePose[originalIndex];
-                var uePos = item.Translation * 0.01f;
+                var uePos = item.Translation * UeToUsdScale;
                 var transformedPos = UsdCoordinateTransformer.TransformPosition(uePos);
                 var ueRot = item.Rotation;
                 var transformedRot = UsdCoordinateTransformer.TransformRotation(ueRot);
@@ -451,7 +657,7 @@ public static class USkeletalMeshToUSD
     }
 
     // Root USD を作り、geo/skeleton を reference で取り込む（結果として一つの SkelRoot 配下に統合される）
-    private static void WriteRootUsd(string filePath, string primName, string geoFilePath, string skeletonFilePath)
+    private static void WriteRootUsd(string filePath, string primName, string geoFileRelPath, string skeletonFileRelPath)
     {
         using (var stage = UsdStage.CreateNew(filePath))
         {
@@ -470,12 +676,12 @@ public static class USkeletalMeshToUSD
             var geoPrim = stage.DefinePrim(geoTargetPath);
             // 参照を追加： geoFile を参照して、その内部にある /Geo をここにマップ
             // Sdf.Reference の呼び出し方はバインディング依存なので必要に応じて修正してください
-            geoPrim.GetReferences().AddReference(new SdfReference(Path.GetFileName(geoFilePath), new SdfPath(ScopePath)));
+            geoPrim.GetReferences().AddReference(new SdfReference(geoFileRelPath, new SdfPath(ScopePath)));
 
             // 同様に /SkelRoot/Skeleton を作り、skeletonFile を reference
             var skeletonTargetPath = skelRootPath.AppendPath(new SdfPath(ScopeSkeletonPath.TrimStart('/'))); // /SkelRoot/Skeleton
             var skeletonPrim = stage.DefinePrim(skeletonTargetPath);
-            skeletonPrim.GetReferences().AddReference(new SdfReference(Path.GetFileName(skeletonFilePath), new SdfPath(ScopeSkeletonPath)));
+            skeletonPrim.GetReferences().AddReference(new SdfReference(skeletonFileRelPath, new SdfPath(ScopeSkeletonPath)));
 
             // 最後に、Geo 内の Mesh と Skeleton の間に binding を作る（ここでは prim path を仮定）
             // 例: /SkelRoot/Geo/<primName> がメッシュ、/SkelRoot/Skeleton/<skeletonName> がスケルトン
@@ -495,11 +701,36 @@ public static class USkeletalMeshToUSD
                 Console.WriteLine($"Warning: mesh prim {meshPrimPath} not present in composed stage at this time. Binding deferred.");
             }
 
+            // /SkelRoot/Materials を作り、それに geoFile のマテリアル /Materials を reference で /SkelRoot/Materials にマッピング
+            var matsTargetPath = skelRootPath.AppendPath(new SdfPath(ScopeMaterialsPath.TrimStart('/'))); // /SkelRoot/Materials
+            //var matsTargetPath = new SdfPath(ScopeMaterialsPath); // /Materials
+            var matsPrim = stage.DefinePrim(matsTargetPath);
+            matsPrim.GetReferences().AddReference(new SdfReference(geoFileRelPath, new SdfPath(ScopeMaterialsPath)));
+
+            // /SkelRoot/SkeletonsXform を作り、それに skeletonFilePath のXform /Materials を reference で /SkelRoot/SkeletonsXform にマッピング
+            var xformTargetPath = skelRootPath.AppendPath(new SdfPath(ScopeSkeletonsXformPath.TrimStart('/'))); // /SkelRoot/SkeletonsXform 
+            var xformPrim = stage.DefinePrim(xformTargetPath);
+            xformPrim.GetReferences().AddReference(new SdfReference(skeletonFileRelPath, new SdfPath(ScopeSkeletonsXformPath)));
+
+            // 全てのsubsetにマテリアルを再割り当て
+            var subsets = UsdGeomSubset.GetGeomSubsets(UsdGeomImageable.Get(stage, meshPrimPath));
+            foreach (var subset in subsets)
+            {
+                var bindingApiSubset = UsdShadeMaterialBindingAPI.Apply(subset.GetPrim());
+                //var materialPath = new SdfPath(ScopeMaterialsPath).AppendChild(new TfToken(subset.GetPrim().GetName()));// /Materials/MTL_Ene_Def_ChestPouchWaistBelt
+                var materialPath = matsTargetPath.AppendChild(new TfToken(subset.GetPrim().GetName()));
+                var usdMaterial = UsdShadeMaterial.Get(stage, materialPath);
+                if (usdMaterial)
+                {
+                    bindingApiSubset.Bind(usdMaterial);
+                }
+            }
+
+
             stage.GetRootLayer().Save();
         }
 
-        // 重要: root.usda に記述した reference は相対パスとして機能するように、
-        // geoFilePath と skeletonFilePath を同じディレクトリに置いてください（ここではファイル名のみを参照に使っています）。
+        // 重要: root.usda に記述した reference は相対パスとして機能する
 
         return;
     }
@@ -517,31 +748,36 @@ public static class USkeletalMeshToUSD
         return Array.Empty<int>();
     }
 
-    private static void ProcessVerticesAndNormals(FGPUVertFloat[] sourceVertices, out VtVec3fArray usdVertices, out VtVec3fArray usdNormals, out VtVec2fArray usdUV0s, out VtVec2fArray usdUV1s)
+    private static void ProcessVerticesAndNormals(FGPUVertFloat[] sourceVertices, out VtVec3fArray usdVertices, out VtVec3fArray usdNormals, out List<VtVec2fArray> usdUVs)
     {
         usdVertices = new VtVec3fArray((uint)sourceVertices.Length);
         usdNormals = new VtVec3fArray((uint)sourceVertices.Length);
-        usdUV0s = new VtVec2fArray((uint)sourceVertices.Length);
-        usdUV1s = new VtVec2fArray((uint)sourceVertices.Length);
+
+        // 可変長UVsに対応
+        usdUVs = new List<VtVec2fArray>();
+        var uvcount = sourceVertices.Max(x => x.UV.Length);
+        for (int i = 0; i < uvcount; i++)
+        {
+            usdUVs.Add(new VtVec2fArray((uint)sourceVertices.Length));
+        }
 
         for (int i = 0; i < sourceVertices.Length; i++)
         {
             var vertex = sourceVertices[i];
-            var uePos = vertex.Pos * 0.01f; // Scale to meters
+            var uePos = vertex.Pos * UeToUsdScale; // Scale to meters
             var ueNormal = vertex.Normal[2]; // 3つ目が法線
-            var ueUV0 = vertex.UV[0];
-            var ueUV1 = vertex.UV[1];
+
+            for (int x = 0; x < uvcount; x++)
+            {
+                usdUVs[x][i] = new GfVec2f(vertex.UV[x].U, 1.0f - vertex.UV[x].V);// UEのV座標は反転が必要な場合が多い
+            }
 
             var transformedPos = UsdCoordinateTransformer.TransformPosition(uePos);
             var transformedNormal = UsdCoordinateTransformer.TransformNormal(ueNormal);
-            var transformedUV0 = ueUV0;
-            var transformedUV1 = ueUV1;
 
 
             usdVertices[i] = new GfVec3f(transformedPos.X, transformedPos.Y, transformedPos.Z);
             usdNormals[i] = new GfVec3f(transformedNormal.X, transformedNormal.Y, transformedNormal.Z);
-            usdUV0s[i] = new GfVec2f(transformedUV0.U, 1.0f - transformedUV0.V); // UEのV座標は反転が必要な場合が多い
-            usdUV1s[i] = new GfVec2f(transformedUV1.U, 1.0f - transformedUV1.V); // 同上
         }
 
         return;
@@ -784,7 +1020,7 @@ public class BlendShapeProcessor
             for (int i = 0; i < deltas.Length; i++)
             {
                 var delta = deltas[i];
-                var ueDeltaPos = delta.PositionDelta * 0.01f; // Scale to meters
+                var ueDeltaPos = delta.PositionDelta * USkeletalMeshToUSD.UeToUsdScale; // Scale to meters
                 var transformedDeltaPos = UsdCoordinateTransformer.TransformPosition(ueDeltaPos);
                 //var transformedDeltaPos = ueDeltaPos;
 
@@ -915,7 +1151,7 @@ public static class UsdTextureExporter
         var result = new Dictionary<string, string>();
         if (materialInstance == null) return result;
 
-        var materialDirectoryPath = Path.Combine(outputDirectory, USkeletalMeshToUSD.SanitizeUsdName(materialInstance.Name ?? "Material"));
+        var materialDirectoryPath = Path.Combine(outputDirectory, "Textures");
         Directory.CreateDirectory(materialDirectoryPath);
         string outputFilePath;
         var decoder = new BcDecoder();
@@ -931,6 +1167,8 @@ public static class UsdTextureExporter
                 {
                     continue;
                 }
+
+                Console.WriteLine($"Export: {texture2D.Name}");
 
                 // StreamingVirtualTexture
                 if (texture2D.PlatformData?.VTData != null)
@@ -1103,7 +1341,7 @@ public static class VirtualTextureExporter
         int bytesPerBlock = GetBytesPerBlock(texture2D.Format);
         if (bytesPerBlock == 0)
         {
-            Console.WriteLine($"未対応の圧縮フォーマット: {texture2D.Format}");
+            Console.WriteLine($"VTData未対応の圧縮フォーマット: {texture2D.Format}");
             return;
         }
 
@@ -1114,13 +1352,13 @@ public static class VirtualTextureExporter
         {
             int blocksPerSide = paddedTileSize / 4;
             bytesPerTile = blocksPerSide * blocksPerSide * bytesPerBlock;
-            Console.WriteLine($"タイルあたりのバイト数 (圧縮): {bytesPerTile}");
+            //Console.WriteLine($"タイルあたりのバイト数 (圧縮): {bytesPerTile}");
         }
         else
         {
             int bytesPerPixel = texture2D.IsHDR ? 16 : 4; // HDR (FloatRGBA) は16バイト、LDR (B8G8R8A8) は4バイト
             bytesPerTile = paddedTileSize * paddedTileSize * bytesPerPixel;
-            Console.WriteLine($"タイルあたりのバイト数 (非圧縮): {bytesPerTile}");
+            //Console.WriteLine($"タイルあたりのバイト数 (非圧縮): {bytesPerTile}");
         }
 
         // 最終画像バッファを準備 (RGBA, ピクセルあたり4バイト)

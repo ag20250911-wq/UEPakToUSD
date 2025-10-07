@@ -133,43 +133,12 @@ internal class Program
                     USkeletalMeshToUSD.ConvertToSplitUsd(obj33, dir + "\\");
                     File.AppendAllText(dir + "\\done.txt", objname + "\n");
                     continue;
-
-                    foreach (var lod in obj33.LODModels)
-                    {
-                        
-
-                        break;
-                        continue;
-
-
-
-
-
-
-                        if (lod.Chunks.Length > 0)
-                        {
-                            var chunk = lod.Chunks[0];
-                        }
-                        var name = dir + "\\" + obj33.Name;
-                        string content = "g\n";
-                        foreach (var item in lod.VertexBufferGPUSkin.VertsFloat)
-                        {
-                            content += "v ";
-                            content += item.Pos.X.ToString() + " ";
-                            content += item.Pos.Y.ToString() + " ";
-                            content += item.Pos.Z.ToString() + "\n";
-
-                        }
-
-                        File.WriteAllText(name + ".obj", content);
-
-                        break;
-                        continue;
-                    }
-
-                    continue;
                 }
 
+                if (export is UAnimSequence uAnimSequence)
+                {
+                    continue;
+                }
 
 
                 if (export is USoundBase objx)
