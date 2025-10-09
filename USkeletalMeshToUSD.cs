@@ -358,22 +358,43 @@ public static class USkeletalMeshToUSD
                 try
                 {
                     var materialObject = materialInterfaces[section.MaterialIndex];
-                    if (materialObject != null && materialObject.TryLoad(out UObject loadedMaterialObject) && loadedMaterialObject is UMaterialInstanceConstant materialInstance)
+                    if (materialObject != null && materialObject.TryLoad(out UObject loadedMaterialObject))
                     {
-                        var exportedTextures = UsdTextureExporter.ExportMaterialTextures(materialInstance, matDir); // matDirにエクスポート
+                        Dictionary<string, string> exportedTextures = new Dictionary<string, string>();
+                        bool isBaseMaterial = false;
+                        if (loadedMaterialObject is UMaterialInstanceConstant materialInstanceConstant)
+                        {
+                            exportedTextures = UsdTextureExporter.ExportMaterialTextures(materialInstanceConstant, matDir);
+                        }
+                        else if (loadedMaterialObject is UMaterialInstance materialInstance)
+                        {
+                            Console.WriteLine($"Unsupported material type: {loadedMaterialObject.GetType().Name}");
+                            exportedTextures = new Dictionary<string, string>();
+                        }
+                        else if (loadedMaterialObject is UMaterial material)
+                        {
+                            // UMaterial の処理: Expressionsからテクスチャを抽出
+                            Console.WriteLine($"Processing base UMaterial: {material.Name}");
+                            exportedTextures = UsdTextureExporter.ExportBaseMaterialTextures(material, matDir);
+                            File.WriteAllText(Path.Combine(matDir, "isBaseMaterial"),"");
+                            isBaseMaterial = true;
+                        }
+                        else
+                        {
+                            Console.WriteLine($"Unsupported material type: {loadedMaterialObject.GetType().Name}");
+                            exportedTextures = new Dictionary<string, string>();
+                        }
 
                         // exportedTexturesの値を相対パスに変換
                         var relativeTextures = exportedTextures.ToDictionary(
                             kv => kv.Key,
                             kv => "./Textures/" + Path.GetFileName(kv.Value)
                         );
-
                         // relativeTexturesをファイルに保存（例: JSON形式でデバッグ用）
                         var texturesFilePath = Path.Combine(matDir, "exportedTextures.json");
                         File.WriteAllText(texturesFilePath, Newtonsoft.Json.JsonConvert.SerializeObject(relativeTextures, Newtonsoft.Json.Formatting.Indented));
-
                         // テクスチャ接続をリファクタリングしたメソッドで処理
-                        ConnectTexturesToShader(matStage, matPath, pbrShader, stReader, exportedTextures, matDir);
+                        ConnectTexturesToShader(matStage, matPath, pbrShader, stReader, exportedTextures, matDir, isBaseMaterial);
                     }
                 }
                 catch (Exception ex)
@@ -386,15 +407,15 @@ public static class USkeletalMeshToUSD
         }
     }
 
-    private static void ConnectTexturesToShader(UsdStage matStage, SdfPath matPath, UsdShadeShader pbrShader, UsdShadeShader stReader, Dictionary<string, string> exportedTextures, string matDir)
+    private static void ConnectTexturesToShader(UsdStage matStage, SdfPath matPath, UsdShadeShader pbrShader, UsdShadeShader stReader, Dictionary<string, string> exportedTextures, string matDir, bool isBaseMaterial)
     {
         // 接続されたテクスチャを追跡するための辞書（入力名 -> 相対パス）
         var connectedTextures = new Dictionary<string, string>();
 
-        // テクスチャの可能なキー名をマッピング（大文字小文字のバリエーションを考慮）
+        // パラメータ名で判別する場合のマッピング
         var textureMappings = new Dictionary<string, string[]>
     {
-        { "diffuseColor", new[] { "BaseColor", "Albedo", "basecolor", "Base Color", "BaseColorTexture", "DiffuseMap", "Basecolor", "BaseColor/Opacity", "IrisColor" } },
+        { "diffuseColor", new[] { "BaseColor", "Albedo", "basecolor", "Base Color", "BaseColorTexture", "DiffuseMap", "Basecolor", "BaseColor/Opacity", "IrisColor" , "BaseColorSkeleton" } },
         { "normal", new[] { "BaseNormal", "Normal", "NormalMap", "NormalTexture", "ObjNormal" } },
         { "emissiveColor", new[] { "Emissive", "EmissiveColor", "EmissiveMap", "Emission" } },
         { "roughness", new[] { "Roughness", "RoughnessMap" } },
@@ -407,9 +428,23 @@ public static class USkeletalMeshToUSD
         { "displacement", new[] { "Displacement", "DisplacementMap", "HeightMap" } }
     };
 
-        // パックされたテクスチャのサポート（例: MRO - Metallic in B, Roughness in G, Occlusion in R など、Unrealの標準に合わせて調整）
-        // ここでは一般的なGLTFスタイルを仮定: MetallicRoughnessテクスチャで B=Metallic, G=Roughness, R=Occlusion (オプション)
-        // SASRや他のパック形式も同様に扱えるよう拡張可能。実際のUnrealマテリアルに基づいてチャンネルを調整。
+        // テクスチャ名で判別する場合のマッピング（Unreal Engineの一般的なサフィックスや命名規則に基づく）
+        var textureNameMappings = new Dictionary<string, string[]>
+    {
+        { "diffuseColor", new[] { "_Albedo", "_BaseColor", "_Diffuse", "_Color" } },
+        { "normal", new[] { "_Normal" } },
+        { "emissiveColor", new[] { "_Emissive", "_Emission" } },
+        { "roughness", new[] { "_Roughness" } },
+        { "metallic", new[] { "_Metallic", "_Metalness" } },
+        { "specularColor", new[] { "_Specular" } },
+        { "clearcoat", new[] { "_Clearcoat" } },
+        { "clearcoatRoughness", new[] { "_ClearcoatRoughness" } },
+        { "opacity", new[] { "_Opacity", "_Alpha", "_Mask" } },
+        { "occlusion", new[] { "_Occlusion", "_AmbientOcclusion" } },
+        { "displacement", new[] { "_Disp", "_Displacement", "_Height" } }
+    };
+
+        // パックされたテクスチャのサポート（パラメータ名用）
         var packedTextureMappings = new Dictionary<string, (string[] keys, Dictionary<string, (string channel, string inputName)> channels)>
     {
         { "MRO", (new[] { "MRO", "MetallicRoughnessOcclusion", "PackedMRO" }, new Dictionary<string, (string, string)>
@@ -425,7 +460,7 @@ public static class USkeletalMeshToUSD
                 { "roughness", ("g", "roughness") }, // Roughness
                 { "occlusion", ("a", "occlusion") }  // Occlusion
             })
-        },        
+        },
         { "ORM", (new[] { "ORMTexture" , "OcclusionRoughnessMetalic" }, new Dictionary<string, (string, string)>
             {
                 { "metallic", ("b", "metallic") },  // Blue channel for Metallic (GLTF standard)
@@ -433,37 +468,76 @@ public static class USkeletalMeshToUSD
                 { "occlusion", ("r", "occlusion") }  // Red for Occlusion
             })
         },
-        
-
-        // SASRの例（仮定: Subsurface in R, AmbientOcclusion in G, Specular in B, Roughness in A など。必要に応じて調整）
         { "SASR", (new[] { "SASR", "SubsurfaceAmbientSpecularRoughness", "PackedSASR", "SASRTexture" }, new Dictionary<string, (string, string)>
             {
-                // { "subsurface", ("r", "subsurface") }, // USD PreviewSurfaceにはsubsurfaceがないのでスキップまたは拡張
                 { "occlusion", ("g", "occlusion") },
                 { "specular", ("b", "specularLevel") }, // specularLevelにマップ（useSpecularWorkflow=1の場合）
                 { "roughness", ("a", "roughness") }
             })
         },
-        // FAMRの追加（仮定: Fuzziness in R (無視), AmbientOcclusion in G, Metallic in B, Roughness in A）
         { "FAMR", (new[] { "FAMR", "FuzzAmbientMetallicRoughness", "PackedFAMR" , "COMRTexture" , "Metallic/Roughness/Specular" }, new Dictionary<string, (string, string)>
             {
                 { "occlusion", ("g", "occlusion") },    // G: Ambient Occlusion
                 { "metallic", ("b", "metallic") },      // B: Metallic
                 { "roughness", ("a", "roughness") }     // A: Roughness
-                // F (R: Fuzziness) は無視（USD PreviewSurfaceで直接サポートされていないため）
             })
         }
-        // 他のパック形式を追加可能
     };
 
+        // パックされたテクスチャのサポート（テクスチャ名用、サフィックスベース）
+        var packedTextureNameMappings = new Dictionary<string, (string[] keys, Dictionary<string, (string channel, string inputName)> channels)>
+    {
+        { "MRO", (new[] { "_MRO", "_MetallicRoughnessOcclusion" }, new Dictionary<string, (string, string)>
+            {
+                { "metallic", ("b", "metallic") },
+                { "roughness", ("g", "roughness") },
+                { "occlusion", ("r", "occlusion") }
+            })
+        },
+        { "MRSO", (new[] { "_MRSO"}, new Dictionary<string, (string, string)>
+            {
+                { "metallic", ("r", "metallic") },
+                { "roughness", ("g", "roughness") },
+                { "occlusion", ("a", "occlusion") }
+            })
+        },
+        { "ORM", (new[] { "_ORM" , "_OcclusionRoughnessMetallic" }, new Dictionary<string, (string, string)>
+            {
+                { "metallic", ("b", "metallic") },
+                { "roughness", ("g", "roughness") },
+                { "occlusion", ("r", "occlusion") }
+            })
+        },
+        { "SASR", (new[] { "_SASR", "_SubsurfaceAmbientSpecularRoughness" }, new Dictionary<string, (string, string)>
+            {
+                { "occlusion", ("g", "occlusion") },
+                { "specular", ("b", "specularLevel") },
+                { "roughness", ("a", "roughness") }
+            })
+        },
+        { "FAMR", (new[] { "_FAMR", "_FuzzAmbientMetallicRoughness", "_COMR" , "_MetallicRoughnessSpecular" }, new Dictionary<string, (string, string)>
+            {
+                { "occlusion", ("g", "occlusion") },
+                { "metallic", ("b", "metallic") },
+                { "roughness", ("a", "roughness") }
+            })
+        }
+    };
+
+        // 使用するマッピングを選択
+        var currentTextureMappings = isBaseMaterial ? textureNameMappings : textureMappings;
+        var currentPackedMappings = isBaseMaterial ? packedTextureNameMappings : packedTextureMappings;
+
         // 個別テクスチャの接続
-        foreach (var mapping in textureMappings)
+        foreach (var mapping in currentTextureMappings)
         {
             string texturePath = null;
-            foreach (var key in mapping.Value)
+            foreach (var kv in exportedTextures)
             {
-                if (exportedTextures.TryGetValue(key, out texturePath))
+                string checkString = isBaseMaterial ? Path.GetFileNameWithoutExtension(kv.Value) : kv.Key;
+                if (mapping.Value.Any(m => checkString.Contains(m, StringComparison.OrdinalIgnoreCase)))
                 {
+                    texturePath = kv.Value;
                     break;
                 }
             }
@@ -477,13 +551,15 @@ public static class USkeletalMeshToUSD
         }
 
         // パックされたテクスチャの接続
-        foreach (var packed in packedTextureMappings)
+        foreach (var packed in currentPackedMappings)
         {
             string packedTexturePath = null;
-            foreach (var key in packed.Value.keys)
+            foreach (var kv in exportedTextures)
             {
-                if (exportedTextures.TryGetValue(key, out packedTexturePath))
+                string checkString = isBaseMaterial ? Path.GetFileNameWithoutExtension(kv.Value) : kv.Key;
+                if (packed.Value.keys.Any(k => checkString.Contains(k, StringComparison.OrdinalIgnoreCase)))
                 {
+                    packedTexturePath = kv.Value;
                     break;
                 }
             }
@@ -511,16 +587,16 @@ public static class USkeletalMeshToUSD
                     var inputName = channelMap.Value.inputName;
                     pbrShader.CreateInput(new TfToken(inputName), GetSdfTypeForInput(inputName))
                         .ConnectToSource(texShader.ConnectableAPI(), new TfToken(outputName));
-                    // パックテクスチャの場合、種類としてinputNameをキーとし、相対パスを値として記録（同じパスを複数に共有）
                     connectedTextures[inputName] = relativePath + " (channel: " + outputName + ")";
                 }
             }
         }
 
         // specularWorkflowの設定（metallicがある場合0、specularがある場合1）
-        bool hasMetallic = exportedTextures.Any(kv => textureMappings["metallic"].Contains(kv.Key) || packedTextureMappings.Values.Any(p => p.channels.ContainsKey("metallic")));
-        bool hasSpecular = exportedTextures.Any(kv => textureMappings["specularColor"].Contains(kv.Key) || packedTextureMappings.Values.Any(p => p.channels.ContainsKey("specular")));
-        pbrShader.CreateInput(new TfToken("useSpecularWorkflow"), SdfValueTypeNames.Int).Set(hasSpecular ? 1 : 0);
+        bool hasMetallic = connectedTextures.ContainsKey("metallic");
+        bool hasSpecular = connectedTextures.ContainsKey("specularColor") || connectedTextures.ContainsKey("specularLevel");
+        int workflow = hasSpecular && !hasMetallic ? 1 : 0;
+        pbrShader.CreateInput(new TfToken("useSpecularWorkflow"), SdfValueTypeNames.Int).Set(workflow);
 
         // 接続されたテクスチャをJSONファイルに出力
         var connectedTexturesFilePath = Path.Combine(matDir, "connectedTextures.json");
@@ -622,6 +698,11 @@ public static class USkeletalMeshToUSD
                 var jointFullPath = new SdfPath(ScopeSkeletonsXformPath).AppendPath(new SdfPath(jointRelPath));
                 var usdXform = UsdGeomXform.Define(stage, jointFullPath);
                 usdXform.AddTransformOp().Set(localM);
+
+                // ボーンのPrimに元のボーン名をue:originalNameアトリビュートとして追加
+                var originalBoneName = skeletalMesh.ReferenceSkeleton.FinalRefBoneInfo[originalIndex].Name.Text;
+                usdXform.GetPrim().CreateAttribute(new TfToken(OriginalNameAttribute), SdfValueTypeNames.String).Set(originalBoneName);
+
                 usdXforms.Add(usdXform);
             }
 
@@ -1143,7 +1224,6 @@ public static class UsdCoordinateTransformer
         return Vector3.Normalize(new Vector3(nX, nY, nZ));
     }
 }
-
 public static class UsdTextureExporter
 {
     public static Dictionary<string, string> ExportMaterialTextures(UMaterialInstanceConstant materialInstance, string outputDirectory)
@@ -1194,7 +1274,7 @@ public static class UsdTextureExporter
                 if (texture2D.IsTextureCube) continue;
 
                 outputFilePath = Path.Combine(materialDirectoryPath, texture2D.Name) + (texture2D.IsHDR ? ".tiff" : ".png");
-                SaveTextureImage(decodedPixelData, width, height, texture2D.IsHDR, outputFilePath);
+                SaveTextureImage(decodedPixelData, width, height, texture2D.IsHDR, outputFilePath, texture2D.Format);
                 // 保存したテクスチャのパスを辞書に登録
                 result[textureParameter.ParameterInfo.Name.PlainText] = outputFilePath;
             }
@@ -1207,32 +1287,113 @@ public static class UsdTextureExporter
         return result;
     }
 
-    public static byte[] DecodeTextureData(BcDecoder decoder, UTexture2D texture2D, byte[] compressedData, int width, int height)
+    public static Dictionary<string, string> ExportBaseMaterialTextures(UMaterial material, string outputDirectory)
+    {
+        var result = new Dictionary<string, string>();
+        if (material == null) return result;
+
+        var materialDirectoryPath = Path.Combine(outputDirectory, "Textures");
+        Directory.CreateDirectory(materialDirectoryPath);
+        string outputFilePath;
+        var decoder = new BcDecoder();
+
+        List<UTexture> referencedTextures = material.ReferencedTextures ?? new List<UTexture>();
+
+        foreach (var tex in referencedTextures)
+        {
+            try
+            {
+                if (tex == null) continue;
+                if (tex is not UTexture2D texture2D)
+                {
+                    continue;
+                }
+
+                Console.WriteLine($"Export from base material: {texture2D.Name}");
+
+
+                string key = texture2D.Name;
+                // StreamingVirtualTexture
+                if (texture2D.PlatformData?.VTData != null)
+                {
+                    outputFilePath = Path.Combine(materialDirectoryPath, texture2D.Name) + (texture2D.IsHDR ? ".tiff" : ".png");
+                    VirtualTextureExporter.ExportVirtualTexture(decoder, texture2D, outputFilePath);
+                    // 保存したテクスチャのパスを辞書に登録
+                    result[key] = outputFilePath;
+                    continue;
+                }
+
+
+
+                var mipMap = texture2D.GetFirstMip();
+                if (mipMap?.BulkData?.Data == null || mipMap.SizeX == 0 || mipMap.SizeY == 0) continue;
+
+                var compressedData = mipMap.BulkData.Data;
+                int width = mipMap.SizeX;
+                int height = mipMap.SizeY;
+
+                byte[] decodedPixelData = DecodeTextureData(decoder, texture2D, compressedData, width, height);
+
+                if (decodedPixelData == null) continue;
+
+                if (texture2D.IsTextureCube) continue;
+
+                outputFilePath = Path.Combine(materialDirectoryPath, texture2D.Name) + (texture2D.IsHDR ? ".tiff" : ".png");
+                SaveTextureImage(decodedPixelData, width, height, texture2D.IsHDR, outputFilePath, texture2D.Format);
+                result[key] = outputFilePath;
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Warning: Failed to export a texture from base material. {ex.Message}");
+            }
+        }
+
+        return result;
+    }
+
+    public static byte[] DecodeTextureData(BcDecoder decoder, UTexture2D texture2D, byte[] rawData, int width, int height)
     {
         byte[] decodedPixelData = null;
 
         switch (texture2D.Format)
         {
             case EPixelFormat.PF_B8G8R8A8:
+                // Already in BGRA format, 4 bytes per pixel
+                decodedPixelData = rawData;
+                break;
             case EPixelFormat.PF_G8:
+                // Grayscale, 1 byte per pixel - convert to BGRA
+                decodedPixelData = new byte[width * height * 4];
+                for (int i = 0; i < width * height; i++)
+                {
+                    byte gray = rawData[i];
+                    int offset = i * 4;
+                    decodedPixelData[offset + 0] = gray; // B
+                    decodedPixelData[offset + 1] = gray; // G
+                    decodedPixelData[offset + 2] = gray; // R
+                    decodedPixelData[offset + 3] = 255;  // A
+                }
+                break;
             case EPixelFormat.PF_FloatRGBA when texture2D.IsHDR:
-                decodedPixelData = compressedData;
+                // FloatRGBA, 16 bytes per pixel (4 floats) - convert to RgbaVector (but since it's byte[], it's already in little-endian float bytes)
+                // For saving, we can pass it directly if using RgbaVector which expects float components
+                decodedPixelData = rawData;
                 break;
             case EPixelFormat.PF_DXT1:
-                decodedPixelData = DecodeToBgra(decoder, compressedData, width, height, CompressionFormat.Bc1);
+                decodedPixelData = DecodeToBgra(decoder, rawData, width, height, CompressionFormat.Bc1);
                 break;
             case EPixelFormat.PF_DXT5:
-                decodedPixelData = DecodeToBgra(decoder, compressedData, width, height, CompressionFormat.Bc3);
+                decodedPixelData = DecodeToBgra(decoder, rawData, width, height, CompressionFormat.Bc3);
                 break;
             case EPixelFormat.PF_BC5:
-                decodedPixelData = DecodeToBgra(decoder, compressedData, width, height, CompressionFormat.Bc5);
+                decodedPixelData = DecodeToBgra(decoder, rawData, width, height, CompressionFormat.Bc5);
                 if (texture2D.IsNormalMap && decodedPixelData != null)
                 {
                     ReconstructNormalMapZChannel(decodedPixelData, width, height);
                 }
                 break;
             case EPixelFormat.PF_BC7:
-                decodedPixelData = DecodeToBgra(decoder, compressedData, width, height, CompressionFormat.Bc7);
+                decodedPixelData = DecodeToBgra(decoder, rawData, width, height, CompressionFormat.Bc7);
                 break;
             default:
                 return null;
@@ -1241,17 +1402,26 @@ public static class UsdTextureExporter
         return decodedPixelData;
     }
 
-    public static void SaveTextureImage(byte[] decodedPixelData, int width, int height, bool isHDR, string outputFilePath)
+    public static void SaveTextureImage(byte[] decodedPixelData, int width, int height, bool isHDR, string outputFilePath, EPixelFormat format)
     {
         try
         {
             if (isHDR)
             {
-                var encoder = new TiffEncoder() { BitsPerPixel = TiffBitsPerPixel.Bit64 };
-                
-                using (var image = Image.LoadPixelData<RgbaVector>(decodedPixelData, width, height))
+                // For HDR, assume data is in float format (16 bytes per pixel for FloatRGBA)
+                if (format == EPixelFormat.PF_FloatRGBA)
                 {
-                    image.SaveAsTiff(outputFilePath,encoder);
+                    // Directly load from byte[] as ReadOnlySpan<byte>, internally cast to RgbaVector
+                    using (var image = Image.LoadPixelData<RgbaVector>(decodedPixelData, width, height))
+                    {
+                        var encoder = new TiffEncoder() { BitsPerPixel = TiffBitsPerPixel.Bit64 };
+                        image.SaveAsTiff(outputFilePath, encoder);
+                    }
+                }
+                else
+                {
+                    // Fallback or error
+                    Console.WriteLine($"Unsupported HDR format for saving: {format}");
                 }
             }
             else
@@ -1315,7 +1485,6 @@ public static class UsdTextureExporter
         return;
     }
 }
-
 public static class VirtualTextureExporter
 {
     public static void ExportVirtualTexture(BcDecoder decoder, UTexture2D texture2D, string outputFilePath)
@@ -1337,31 +1506,38 @@ public static class VirtualTextureExporter
         int numTilesX = (int)mipData.Width;
         int numTilesY = (int)mipData.Height;
 
-        // 圧縮フォーマットに基づくタイルあたりのバイト数を計算
+        // 圧縮フォーマットに基づくブロックバイト数を取得（非圧縮時は0）
         int bytesPerBlock = GetBytesPerBlock(texture2D.Format);
-        if (bytesPerBlock == 0)
+        if (bytesPerBlock < 0) // 未対応のフォーマット
         {
             Console.WriteLine($"VTData未対応の圧縮フォーマット: {texture2D.Format}");
             return;
         }
 
         bool isCompressed = bytesPerBlock > 0;
+        int bytesPerPixel = isCompressed ? 4 : GetBytesPerPixel(texture2D.Format); // 非圧縮時はフォーマットに応じたバイト数
+        if (!isCompressed && bytesPerPixel == 0)
+        {
+            Console.WriteLine($"VTData未対応の非圧縮フォーマット: {texture2D.Format}");
+            return;
+        }
+
         int paddedTileSize = tileSize + borderSize * 2;
         int bytesPerTile;
         if (isCompressed)
         {
-            int blocksPerSide = paddedTileSize / 4;
+            int blockSize = 4; // BCフォーマットは4x4ブロック
+            int blocksPerSide = paddedTileSize / blockSize;
             bytesPerTile = blocksPerSide * blocksPerSide * bytesPerBlock;
             //Console.WriteLine($"タイルあたりのバイト数 (圧縮): {bytesPerTile}");
         }
         else
         {
-            int bytesPerPixel = texture2D.IsHDR ? 16 : 4; // HDR (FloatRGBA) は16バイト、LDR (B8G8R8A8) は4バイト
             bytesPerTile = paddedTileSize * paddedTileSize * bytesPerPixel;
             //Console.WriteLine($"タイルあたりのバイト数 (非圧縮): {bytesPerTile}");
         }
 
-        // 最終画像バッファを準備 (RGBA, ピクセルあたり4バイト)
+        // 最終画像バッファを準備 (出力は常にRGBA形式: HDRならFloatRGBA (16バイト)、それ以外はB8G8R8A8 (4バイト))
         int finalBytesPerPixel = texture2D.IsHDR ? 16 : 4;
         var finalImageData = new byte[totalWidth * totalHeight * finalBytesPerPixel];
 
@@ -1393,23 +1569,21 @@ public static class VirtualTextureExporter
                     continue;
                 }
 
-                // 圧縮タイルデータを抽出
+                // タイルデータを抽出
                 var tileData = new byte[bytesPerTile];
                 Array.Copy(chunk.BulkData.Data, finalOffset, tileData, 0, bytesPerTile);
 
-
-                // パッド付きタイルをデコード
+                // パッド付きタイルをデコードまたは準備
                 byte[] decompressedPaddedTile;
-                if (bytesPerBlock > 0)
+                if (isCompressed)
                 {
                     decompressedPaddedTile = UsdTextureExporter.DecodeTextureData(decoder, texture2D, tileData, paddedTileSize, paddedTileSize);
+                    if (decompressedPaddedTile == null) continue;
                 }
                 else
                 {
-                    decompressedPaddedTile = tileData; // 非圧縮の場合、デコード不要
-                    // 注意: B8G8R8A8順はBgra32として保存に適合するため、スワップ不要
+                    decompressedPaddedTile = ConvertToRgbaIfNeeded(tileData, paddedTileSize * paddedTileSize, texture2D.Format, bytesPerPixel, finalBytesPerPixel);
                 }
-                if (decompressedPaddedTile == null) continue;
 
                 // 中央部（境界なし）を最終画像にコピー
                 CopyTileToImage(decompressedPaddedTile, finalImageData, tileX, tileY, tileSize, borderSize, paddedTileSize, totalWidth, finalBytesPerPixel);
@@ -1417,7 +1591,7 @@ public static class VirtualTextureExporter
         }
 
         // アセンブルされた画像を保存
-        UsdTextureExporter.SaveTextureImage(finalImageData, totalWidth, totalHeight, texture2D.IsHDR, outputFilePath);
+        UsdTextureExporter.SaveTextureImage(finalImageData, totalWidth, totalHeight, texture2D.IsHDR, outputFilePath, texture2D.Format);
 
         return;
     }
@@ -1430,11 +1604,55 @@ public static class VirtualTextureExporter
             EPixelFormat.PF_DXT5 => 16,    // BC3
             EPixelFormat.PF_BC5 => 16,
             EPixelFormat.PF_BC7 => 16,
-            EPixelFormat.PF_BC6H => 16,    // ADDED: BC6H
-            EPixelFormat.PF_B8G8R8A8 => -1, // 非圧縮を示すフラグ
-            EPixelFormat.PF_FloatRGBA => -1, // 非圧縮を示すフラグ
+            EPixelFormat.PF_BC6H => 16,
+            EPixelFormat.PF_B8G8R8A8 => 0,  // 非圧縮
+            EPixelFormat.PF_FloatRGBA => 0, // 非圧縮
+            EPixelFormat.PF_G8 => 0,        // 非圧縮
+            _ => -1  // 未対応
+        };
+    }
+
+    private static int GetBytesPerPixel(EPixelFormat format)
+    {
+        return format switch
+        {
+            EPixelFormat.PF_B8G8R8A8 => 4,
+            EPixelFormat.PF_FloatRGBA => 16,
+            EPixelFormat.PF_G8 => 1,
             _ => 0  // 未対応
         };
+    }
+
+    private static byte[] ConvertToRgbaIfNeeded(byte[] sourceData, int pixelCount, EPixelFormat format, int sourceBytesPerPixel, int targetBytesPerPixel)
+    {
+        if (sourceBytesPerPixel == targetBytesPerPixel)
+        {
+            return sourceData; // 変換不要 (例: PF_B8G8R8A8 -> 4バイトRGBA, PF_FloatRGBA -> 16バイトFloatRGBA)
+        }
+
+        // 変換が必要な場合 (例: PF_G8 -> 4バイトRGBA)
+        var convertedData = new byte[pixelCount * targetBytesPerPixel];
+
+        switch (format)
+        {
+            case EPixelFormat.PF_G8:
+                for (int i = 0; i < pixelCount; i++)
+                {
+                    byte gray = sourceData[i];
+                    int offset = i * 4;
+                    convertedData[offset] = gray;     // B
+                    convertedData[offset + 1] = gray; // G
+                    convertedData[offset + 2] = gray; // R
+                    convertedData[offset + 3] = 255;  // A
+                }
+                break;
+            // 他のフォーマットが必要に応じて追加
+            default:
+                Console.WriteLine($"変換未対応のフォーマット: {format}");
+                return null;
+        }
+
+        return convertedData;
     }
 
     private static void CopyTileToImage(byte[] sourceTile, byte[] destImage, int tileX, int tileY, int tileSize, int borderSize, int paddedTileSize, int totalWidth, int bytesPerPixel)

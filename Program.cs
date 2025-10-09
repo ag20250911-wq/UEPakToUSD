@@ -90,8 +90,24 @@ internal class Program
 
 
         //var files = provider.Files.Values.Where(x => x.Path.Contains("Mesaru"));
-        var files = provider.Files.Values.Where(x => x.Path.Contains("SKM_"));
+        //var files = provider.Files.Values.Where(x => x.Path.Contains("SKM_"));
+        //var files = provider.Files.Values;
         //var files = provider.Files.Values.Where(x => x.Path.Contains("SM_"));
+
+        // 1. tested.txtの内容を一度だけ読み込み、高速検索できるHashSetに格納する
+        var testedPaths = new HashSet<string>();
+        string testedFilePath = System.IO.Path.Combine(dir, "tested.txt"); // Path.Combineを使うと安全です
+
+        if (File.Exists(testedFilePath))
+        {
+            // ReadAllLinesでファイル内容をすべて読み込み、その結果でHashSetを初期化
+            testedPaths = new HashSet<string>(File.ReadAllLines(testedFilePath));
+        }
+
+        // 2. LINQのWhere句を使って、tested.txtに"含まれていない"ファイルのみを抽出する
+        //    HashSet.Containsは非常に高速に動作します。
+        var files = provider.Files.Values.Where(file => !testedPaths.Contains(file.Path));
+
         foreach (var file in files)
         {
             // uasset umap のパスを指定 圧縮されてない状態でないと失敗する
@@ -99,83 +115,118 @@ internal class Program
             if (pkg == null)
                 continue;
 
-            foreach (var export in pkg.GetExports())
+
+            using (pkg as IDisposable) // 明示的破棄
             {
-                var t = export.GetType();
-                var tc = t.Name;
-
-
-                if (export is UStaticMesh obj6)
+                foreach (var export in pkg.GetExports())
                 {
-                    var StaticMaterials = obj6.Properties[0].Name;
+                    var t = export.GetType();
+                    var tc = t.Name;
 
-                    //obj6.Properties[0].Tag;
-                    //obj6.Outer.Owner.NameMap
-                    //obj6.Outer
-
-                    //var test = ((CUE4Parse.UE4.Assets.IoPackage)obj6.Outer).ImportedPackages.Value[0];
-                    //var namemap = test.NameMap;
-                    //obj6.Properties[0].Name
-                    if (obj6.RenderData == null)
-                        continue;
-
-                    var v = obj6.RenderData.LODs[0].VertexBuffer;
-                    continue;
-                }
-                if (export is USkeletalMesh obj33)
-                {
-                    var objname = obj33.Name;
-                    if (File.Exists(dir + "\\done.txt"))
+                    if (export is USkeletalMesh obj33)
                     {
-                        if (File.ReadAllLines(dir + "\\done.txt").Contains(objname))
-                            continue;
+                        var objname = obj33.Name;
+                        if (File.Exists(dir + "\\done.txt"))
+                        {
+                            if (File.ReadAllLines(dir + "\\done.txt").Contains(objname))
+                                continue;
+                        }
+                        try
+                        {
+                            USkeletalMeshToUSD.ConvertToSplitUsd(obj33, dir + "\\");
+                            File.AppendAllText(dir + "\\done.txt", objname + "\n");
+                        }
+                        catch (Exception)
+                        {
+
+                        }
+
+                        continue;
                     }
-                    USkeletalMeshToUSD.ConvertToSplitUsd(obj33, dir + "\\");
-                    File.AppendAllText(dir + "\\done.txt", objname + "\n");
-                    continue;
-                }
-
-                if (export is UAnimSequence uAnimSequence)
-                {
-                    continue;
-                }
 
 
-                if (export is USoundBase objx)
-                {
-                    continue;
-                }
 
-                if (export is UTexture2D obj)
-                {
-                    continue;
-                }
-                if (export is UMaterial obj0)
-                {
-                    continue;
-                }
-                if (export is UMediaTexture obj1)
-                {
-                    continue;
-                }
-                if (export is UMaterialInstanceConstant obj4)
-                {
-                    continue;
-                }
+                    if (export is UStaticMesh obj6)
+                    {
+                        var StaticMaterials = obj6.Properties[0].Name;
 
-                //
-                if (tc == "UObject")
-                {
-                    continue;
-                }
+                        //obj6.Properties[0].Tag;
+                        //obj6.Outer.Owner.NameMap
+                        //obj6.Outer
+
+                        //var test = ((CUE4Parse.UE4.Assets.IoPackage)obj6.Outer).ImportedPackages.Value[0];
+                        //var namemap = test.NameMap;
+                        //obj6.Properties[0].Name
+                        if (obj6.RenderData == null)
+                            continue;
+
+                        var v = obj6.RenderData.LODs[0].VertexBuffer;
+                        continue;
+                    }
+
+                    if (export is UAnimSequence uAnimSequence)
+                    {
+                        var skelton = uAnimSequence.Skeleton;
 
 
-                if (export is UObject obj50)
-                {
-                    continue;
+                        // ボーン数
+                        var bones = uAnimSequence.GetNumTracks();
+
+                        //var boneIndex = uAnimSequence.GetTrackBoneIndex(trackIndex);
+
+                        continue;
+                    }
+
+
+                    if (export is USoundBase objx)
+                    {
+                        continue;
+                    }
+
+                    if (export is UTexture2D obj)
+                    {
+                        continue;
+                    }
+                    if (export is UMaterial obj0)
+                    {
+                        continue;
+                    }
+                    if (export is UMediaTexture obj1)
+                    {
+                        continue;
+                    }
+                    if (export is UMaterialInstanceConstant obj4)
+                    {
+                        continue;
+                    }
+
+                    //
+                    if (tc == "UObject")
+                    {
+                        continue;
+                    }
+
+
+                    if (export is UObject obj50)
+                    {
+                        continue;
+                    }
+
                 }
 
+
+                try
+                {
+                    File.AppendAllText(dir + "\\tested.txt", file.Path + "\n");
+                }
+                catch (Exception)
+                {
+
+                }
             }
+        
+
+            
         }
 
 
