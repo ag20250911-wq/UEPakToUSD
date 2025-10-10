@@ -31,6 +31,8 @@ public static class USkeletalMeshToUSD
 {
     private const string OriginalNameAttribute = "ue:originalName";
     private const string OriginalMaterialSlotNameAttribute = "ue:originalMaterialSlotName";
+    private const string OriginalSkeletonNameAttribute = "ue:originalSkeletonName";
+    private const string OriginalSkeletonPathAttribute = "ue:originalSkeletonPath";
     public static float UeToUsdScale = 0.01f; // UE units to meters
 
     public static string ScopePath { get; set; } = "/Geo";
@@ -658,6 +660,14 @@ public static class USkeletalMeshToUSD
             var skeletonName = SanitizeUsdName(skeletalMesh.Name ?? "Skeleton");
             var skeletonPath = skelScope.GetPath().AppendChild(new TfToken(skeletonName));
             var usdSkeleton = UsdSkelSkeleton.Define(stage, skeletonPath);
+            // Skeleton Primに元のスケルトン名とパスをue:originalSkeletonName, ue:originalSkeletonPathとして追加
+            var skeletonPrim = usdSkeleton.GetPrim();
+            if (skeletalMesh.Skeleton.ResolvedObject != null)
+            {
+                skeletonPrim.CreateAttribute(new TfToken(OriginalSkeletonNameAttribute), SdfValueTypeNames.String).Set(skeletalMesh.Skeleton.ResolvedObject.Name.Text);
+                skeletonPrim.CreateAttribute(new TfToken(OriginalSkeletonPathAttribute), SdfValueTypeNames.String).Set(skeletalMesh.Skeleton.ResolvedObject.GetPathName());
+            }
+
 
             int numBones = usedBoneIndices.Count;
             var restArray = new VtMatrix4dArray((uint)numBones);
@@ -946,7 +956,7 @@ public static class USkeletalMeshToUSD
         return;
     }
 
-    private static VtTokenArray BuildUsdBonePaths(FMeshBoneInfo[] boneInfo, List<int> usedBoneIndices)
+    public static VtTokenArray BuildUsdBonePaths(FMeshBoneInfo[] boneInfo, List<int> usedBoneIndices)
     {
         var usdBones = new VtTokenArray((uint)usedBoneIndices.Count);
         var bonePaths = new List<string>(usedBoneIndices.Count);

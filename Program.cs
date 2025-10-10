@@ -118,6 +118,7 @@ internal class Program
 
             using (pkg as IDisposable) // 明示的破棄
             {
+                bool isanim = false;
                 foreach (var export in pkg.GetExports())
                 {
                     var t = export.GetType();
@@ -125,6 +126,8 @@ internal class Program
 
                     if (export is USkeletalMesh obj33)
                     {
+                        obj33.Skeleton.TryLoad(out USkeleton skeleton00);
+
                         var objname = obj33.Name;
                         if (File.Exists(dir + "\\done.txt"))
                         {
@@ -133,7 +136,7 @@ internal class Program
                         }
                         try
                         {
-                            USkeletalMeshToUSD.ConvertToSplitUsd(obj33, dir + "\\");
+                            USkeletalMeshToUSD.ConvertToSplitUsd(obj33, dir + "\\", false);
                             File.AppendAllText(dir + "\\done.txt", objname + "\n");
                         }
                         catch (Exception)
@@ -166,13 +169,25 @@ internal class Program
 
                     if (export is UAnimSequence uAnimSequence)
                     {
-                        var skelton = uAnimSequence.Skeleton;
-
 
                         // ボーン数
                         var bones = uAnimSequence.GetNumTracks();
 
                         //var boneIndex = uAnimSequence.GetTrackBoneIndex(trackIndex);
+
+                        // Skeletonをロード
+                        if (uAnimSequence.Skeleton?.TryLoad(out USkeleton skeleton) ?? false)
+                        {
+                            if (skeleton.GetPathName() != "/Game/Art/Character/Skeletons/SK_End.SK_End")
+                            {
+                                continue;
+                            }
+
+                            // アニメーションをUSDに変換（optimizeBonesをfalseに設定、またはアニメーション用に調整）
+                            UAnimSequenceToUSD.ConvertAnimationToUsd(uAnimSequence, skeleton, dir + "\\", false);
+
+                        }
+                        isanim = true;
 
                         continue;
                     }
@@ -214,6 +229,8 @@ internal class Program
 
                 }
 
+                if (isanim)
+                    continue;
 
                 try
                 {
@@ -224,9 +241,9 @@ internal class Program
 
                 }
             }
-        
 
-            
+
+
         }
 
 
