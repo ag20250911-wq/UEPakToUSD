@@ -29,10 +29,11 @@ using System.Xml.Linq;
 
 public static class USkeletalMeshToUSD
 {
-    private const string OriginalNameAttribute = "ue:originalName";
-    private const string OriginalMaterialSlotNameAttribute = "ue:originalMaterialSlotName";
-    private const string OriginalSkeletonNameAttribute = "ue:originalSkeletonName";
-    private const string OriginalSkeletonPathAttribute = "ue:originalSkeletonPath";
+    public const string OriginalNameAttribute = "ue:originalName";
+    public const string OriginalMaterialSlotNameAttribute = "ue:originalMaterialSlotName";
+    public const string OriginalSkeletonNameAttribute = "ue:originalSkeletonName";
+    public const string OriginalSkeletonPathAttribute = "ue:originalSkeletonPath";
+    public const string OriginalJointNamesAttribute = "ue:originalJointNames";
     public static float UeToUsdScale = 0.01f; // UE units to meters
 
     public static string ScopePath { get; set; } = "/Geo";
