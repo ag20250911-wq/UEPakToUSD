@@ -67,12 +67,12 @@ internal class Program
     {
         // 1. ゲームのインストールフォルダとUE Version を指定して、プロバイダーを初期化する
         // C:\Program Files (x86)\Steam\steamapps\common\MGSDelta\MGSDelta\Content\Paks
-        var provider = new DefaultFileProvider(@"H:\Paks\mgs3", SearchOption.AllDirectories, true, new VersionContainer(EGame.GAME_UE5_3));
-        //var provider = new DefaultFileProvider(@"H:\Paks\ue5.3", SearchOption.AllDirectories, true, new VersionContainer(EGame.GAME_UE5_3));
+        //var provider = new DefaultFileProvider(@"H:\Paks\mgs3", SearchOption.AllDirectories, true, new VersionContainer(EGame.GAME_UE5_3));
+        var provider = new DefaultFileProvider(@"H:\Paks\ue5.3", SearchOption.AllDirectories, true, new VersionContainer(EGame.GAME_UE5_3));
 
         // 2. MappingFileを設定
-        provider.MappingsContainer = new FileUsmapTypeMappingsProvider("H:\\Paks\\mgs3\\5.3.2-1582552+++rg5+rel_1.1.1-MGSDelta.usmap");
-        //provider.MappingsContainer = new FileUsmapTypeMappingsProvider("H:\\Paks\\ue5.3\\Mappings.usmap");
+        //provider.MappingsContainer = new FileUsmapTypeMappingsProvider("H:\\Paks\\mgs3\\5.3.2-1582552+++rg5+rel_1.1.1-MGSDelta.usmap");
+        provider.MappingsContainer = new FileUsmapTypeMappingsProvider("H:\\Paks\\ue5.3\\Mappings.usmap");
 
         // 3. プロバイダーを初期化して、.pak ファイルを読み込ませる
         provider.Initialize();
@@ -141,7 +141,7 @@ internal class Program
                         try
                         {
                             USkeletalMeshToUSD.ConvertToSplitUsd(obj33, dir + "\\", true);
-                            File.AppendAllText(dir + "\\done.txt", objname + "\n");
+                            //File.AppendAllText(dir + "\\done.txt", objname + "\n");
                         }
                         catch (Exception)
                         {
@@ -173,7 +173,6 @@ internal class Program
 
                     if (export is UAnimSequence uAnimSequence)
                     {
-                        continue;
                         // ボーン数
                         var bones = uAnimSequence.GetNumTracks();
 
@@ -182,16 +181,22 @@ internal class Program
                         // Skeletonをロード
                         if (uAnimSequence.Skeleton?.TryLoad(out USkeleton skeleton) ?? false)
                         {
-                            if (skeleton.GetPathName() != "/Game/Art/Character/Skeletons/SK_End.SK_End")
+                            /*
+                            switch (uAnimSequence.CompressedDataStructure)
                             {
-                                //continue;
+                                case FUECompressedAnimData ueData:
+                                    {
+                                        isanim = true;
+                                    }
+                                    continue;
                             }
+                            */
 
                             // アニメーションをUSDに変換（optimizeBonesをfalseに設定、またはアニメーション用に調整）
                             UAnimSequenceToUSD.ConvertAnimationToUsd(uAnimSequence, skeleton, dir + "\\", false);
 
                         }
-                        isanim = true;
+                        //isanim = true;
 
                         continue;
                     }

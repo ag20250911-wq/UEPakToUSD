@@ -6,7 +6,6 @@ using CUE4Parse.UE4.Objects.Core.Math;
 using CUE4Parse.UE4.Readers;
 using pxr;
 using System.Runtime.InteropServices;
-using static CUE4Parse.UE4.Objects.Core.i18N.FTextHistory;
 
 public static class UAnimSequenceToUSD
 {
@@ -83,6 +82,7 @@ public static class UAnimSequenceToUSD
             UsdGeom.UsdGeomSetStageUpAxis(stage, UsdGeomTokens.y);
             UsdGeom.UsdGeomSetStageMetersPerUnit(stage, 1);
 
+
             // アニメーションスコープ: /Anims
             var animScopePath = new SdfPath("/Anims");
             var animScope = UsdGeomScope.Define(stage, animScopePath);
@@ -112,7 +112,7 @@ public static class UAnimSequenceToUSD
             usdAnim.GetPrim().CreateAttribute(new TfToken(USkeletalMeshToUSD.OriginalJointNamesAttribute), SdfValueTypeNames.StringArray).Set(usdJointNames);
 
             // アニメーションデータを抽出
-            ProcessAnimationData(animSequence, skeleton, usdAnim, usedBoneIndices);
+            ProcessAnimationData(animSequence, skeleton, usdAnim, usedBoneIndices, stage);
 
             stage.GetRootLayer().Save();
         }
@@ -120,15 +120,375 @@ public static class UAnimSequenceToUSD
     [DllImport(ACLNative.LIB_NAME)]
     private static extern unsafe void nReadACLData(IntPtr compressedTracks, FTransform* inRefPoses, FTrackToSkeletonMap* inTrackToSkeletonMap, FTransform* outAtom);
 
-    private static void ProcessAnimationData(UAnimSequence animSequence, USkeleton skeleton, UsdSkelAnimation usdAnim, List<int> usedBoneIndices)
+    private static List<(float Time, FVector Value)> DecompressTranslationTrack(List<byte> item, float sequenceLength, int numFrames)
+    {
+        if (item == null) return null;
+
+        byte[] data = item.ToArray();
+
+        int pos = 0;
+
+        uint packedInfo = BitConverter.ToUInt32(data, pos); pos += 4;
+
+        AnimationCompressionFormat format = (AnimationCompressionFormat)(packedInfo >> 28);
+
+        int componentMask = (int)((packedInfo >> 24) & 0xF);
+
+        int numKeys = (int)(packedInfo & 0xFFFFFF);
+
+        bool hasTimeTracks = (componentMask & 8) != 0;
+
+        if (numKeys == 0) return null;
+
+        // サポート外フォーマットチェック
+        if (format == AnimationCompressionFormat.ACF_Fixed48NoW || format == AnimationCompressionFormat.ACF_Fixed32NoW || format == AnimationCompressionFormat.ACF_Float32NoW)
+        {
+            throw new NotSupportedException("This format is not supported for translation tracks.");
+        }
+
+        int keySize = 0;
+
+        int preKeySize = 0;
+
+        switch (format)
+        {
+            case AnimationCompressionFormat.ACF_None:
+            case AnimationCompressionFormat.ACF_Float96NoW:
+                keySize = 12;
+                break;
+            case AnimationCompressionFormat.ACF_IntervalFixed32NoW:
+                keySize = 4;
+                preKeySize = 24;
+                break;
+            case AnimationCompressionFormat.ACF_Identity:
+                return new List<(float, FVector)> { (0, new FVector(0, 0, 0)) };
+            default:
+                throw new NotImplementedException($"Unsupported format for translation: {format}");
+        }
+
+        int keyDataSize = numKeys * keySize;
+
+        int timeDataSize = 0;
+
+        int timeByteSize = 0;
+
+        if (hasTimeTracks)
+        {
+            timeDataSize = data.Length - pos - preKeySize - keyDataSize;
+            if (timeDataSize <= 0 || timeDataSize % numKeys != 0) throw new InvalidDataException("Invalid time data size.");
+            timeByteSize = timeDataSize / numKeys;
+            if (timeByteSize != 1 && timeByteSize != 2 && timeByteSize != 4) throw new InvalidDataException("Invalid time byte size.");
+        }
+
+        float frameRate = sequenceLength / (numFrames - 1);
+
+        List<float> times = new List<float>(numKeys);
+
+        if (hasTimeTracks)
+        {
+            for (int k = 0; k < numKeys; k++)
+            {
+                uint frame = 0;
+                if (timeByteSize == 1)
+                {
+                    frame = data[pos++];
+                }
+                else if (timeByteSize == 2)
+                {
+                    frame = BitConverter.ToUInt16(data, pos);
+                    pos += 2;
+                }
+                else
+                {
+                    frame = BitConverter.ToUInt32(data, pos);
+                    pos += 4;
+                }
+                times.Add(frame * frameRate);
+            }
+        }
+        else
+        {
+            float keyInterval = sequenceLength / (numKeys - 1);
+            for (int k = 0; k < numKeys; k++)
+            {
+                times.Add(k * keyInterval);
+            }
+        }
+
+        FVector minValue = new FVector(0, 0, 0);
+        FVector rangeValue = new FVector(1, 1, 1);
+        if (format == AnimationCompressionFormat.ACF_IntervalFixed32NoW)
+        {
+            minValue.X = BitConverter.ToSingle(data, pos); pos += 4;
+            minValue.Y = BitConverter.ToSingle(data, pos); pos += 4;
+            minValue.Z = BitConverter.ToSingle(data, pos); pos += 4;
+            rangeValue.X = BitConverter.ToSingle(data, pos); pos += 4;
+            rangeValue.Y = BitConverter.ToSingle(data, pos); pos += 4;
+            rangeValue.Z = BitConverter.ToSingle(data, pos); pos += 4;
+        }
+
+        List<FVector> values = new List<FVector>(numKeys);
+        switch (format)
+        {
+            case AnimationCompressionFormat.ACF_None:
+            case AnimationCompressionFormat.ACF_Float96NoW:
+                for (int k = 0; k < numKeys; k++)
+                {
+                    float x = 0, y = 0, z = 0;
+
+                    if ((componentMask & 1) != 0)
+                    {
+                        if (pos + 4 > data.Length) throw new InvalidDataException("Insufficient data for X component.");
+                        x = BitConverter.ToSingle(data, pos); pos += 4;
+                    }
+
+                    if ((componentMask & 2) != 0)
+                    {
+                        if (pos + 4 > data.Length) throw new InvalidDataException("Insufficient data for Y component.");
+                        y = BitConverter.ToSingle(data, pos); pos += 4;
+                    }
+
+                    if ((componentMask & 4) != 0)
+                    {
+                        if (pos + 4 > data.Length) throw new InvalidDataException("Insufficient data for Z component.");
+                        z = BitConverter.ToSingle(data, pos); pos += 4;
+                    }
+
+                    values.Add(new FVector(x, y, z));
+                }
+                break;
+            case AnimationCompressionFormat.ACF_IntervalFixed32NoW:
+                float xScale = rangeValue.X / 2047.0f;
+                float yScale = rangeValue.Y / 2047.0f;
+                float zScale = rangeValue.Z / 1023.0f;
+                for (int k = 0; k < numKeys; k++)
+                {
+                    uint packed = BitConverter.ToUInt32(data, pos); pos += 4;
+                    float x = ((packed >> 21) & 0x7FF) * xScale + minValue.X;
+                    float y = ((packed >> 10) & 0x7FF) * yScale + minValue.Y;
+                    float z = (packed & 0x3FF) * zScale + minValue.Z;
+                    values.Add(new FVector(x, y, z));
+                }
+                break;
+        }
+
+        List<(float, FVector)> result = new List<(float, FVector)>(numKeys);
+        for (int k = 0; k < numKeys; k++)
+        {
+            result.Add((times[k], values[k]));
+        }
+        return result;
+    }
+
+    private static List<(float Time, FQuat Value)> DecompressRotationTrack(FArchive reader, int offsetIndex, float sequenceLength, int numFrames)
+    {
+        if (reader == null) return null;
+        
+        int pos = 0;
+        uint packedInfo = reader.Read<UInt32>(); pos += 4;
+
+        AnimationCompressionFormat format = (AnimationCompressionFormat)(packedInfo >> 28);
+
+        int componentMask = (int)((packedInfo >> 24) & 0xF);
+
+        int numKeys = (int)(packedInfo & 0xFFFFFF);
+
+        bool hasTimeTracks = (componentMask & 8) != 0;
+
+        if (numKeys == 0) return null;
+
+        int keySize = 0;
+
+        int preKeySize = 0;
+
+        switch (format)
+        {
+            case AnimationCompressionFormat.ACF_None:
+                keySize = 16;
+                break;
+            case AnimationCompressionFormat.ACF_Float96NoW:
+                keySize = 12;
+                break;
+            case AnimationCompressionFormat.ACF_Fixed48NoW:
+                keySize = 6;
+                break;
+            case AnimationCompressionFormat.ACF_IntervalFixed32NoW:
+                keySize = 4;
+                preKeySize = 24;
+                break;
+            case AnimationCompressionFormat.ACF_Fixed32NoW:
+                keySize = 4;
+                break;
+            case AnimationCompressionFormat.ACF_Float32NoW:
+                throw new NotImplementedException("ACF_Float32NoW decompression not implemented.");
+            case AnimationCompressionFormat.ACF_Identity:
+                return new List<(float, FQuat)> { (0, FQuat.Identity) };
+            default:
+                throw new NotImplementedException($"Unsupported format for rotation: {format}");
+        }
+
+        int keyDataSize = numKeys * keySize;
+
+        int timeDataSize = 0;
+
+        int timeByteSize = 0;
+
+        if (hasTimeTracks)
+        {
+            timeDataSize = (int)reader.Length - (int)offsetIndex - pos - preKeySize - keyDataSize;
+            if (timeDataSize <= 0 || timeDataSize % numKeys != 0) throw new InvalidDataException("Invalid time data size.");
+            timeByteSize = timeDataSize / numKeys;
+            if (timeByteSize != 1 && timeByteSize != 2 && timeByteSize != 4) throw new InvalidDataException("Invalid time byte size.");
+        }
+
+        float frameRate = sequenceLength / (numFrames - 1);
+
+        List<float> times = new List<float>(numKeys);
+
+        if (hasTimeTracks)
+        {
+            for (int k = 0; k < numKeys; k++)
+            {
+                uint frame = 0;
+                if (timeByteSize == 1)
+                {
+                    //frame = data[pos++];
+                    pos++;
+                }
+                else if (timeByteSize == 2)
+                {
+                    //frame = BitConverter.ToUInt16(data, pos);
+                    pos += 2;
+                }
+                else
+                {
+                    //frame = BitConverter.ToUInt32(data, pos);
+                    pos += 4;
+                }
+                times.Add(frame * frameRate);
+            }
+        }
+        else
+        {
+            float keyInterval = sequenceLength / (numKeys - 1);
+            for (int k = 0; k < numKeys; k++)
+            {
+                times.Add(k * keyInterval);
+            }
+        }
+
+        FVector minValue = new FVector(0, 0, 0);
+        FVector rangeValue = new FVector(1, 1, 1);
+        if (format == AnimationCompressionFormat.ACF_IntervalFixed32NoW)
+        {
+            //minValue.X = BitConverter.ToSingle(data, pos); pos += 4;
+            //minValue.Y = BitConverter.ToSingle(data, pos); pos += 4;
+            //minValue.Z = BitConverter.ToSingle(data, pos); pos += 4;
+            //rangeValue.X = BitConverter.ToSingle(data, pos); pos += 4;
+            //rangeValue.Y = BitConverter.ToSingle(data, pos); pos += 4;
+            //rangeValue.Z = BitConverter.ToSingle(data, pos); pos += 4;
+            int test = 0;
+        }
+
+        List<FQuat> values = new List<FQuat>(numKeys);
+        float sqrt2_2 = (float)Math.Sqrt(2.0) / 2.0f;
+        switch (format)
+        {
+            case AnimationCompressionFormat.ACF_None:
+                for (int k = 0; k < numKeys; k++)
+                {
+                    //float x = BitConverter.ToSingle(data, pos); pos += 4;
+                    //float y = BitConverter.ToSingle(data, pos); pos += 4;
+                    //float z = BitConverter.ToSingle(data, pos); pos += 4;
+                    //float w = BitConverter.ToSingle(data, pos); pos += 4;
+                    //values.Add(new FQuat(x, y, z, w));
+                }
+                break;
+            case AnimationCompressionFormat.ACF_Float96NoW:
+                for (int k = 0; k < numKeys; k++)
+                {
+                    //float x = BitConverter.ToSingle(data, pos); pos += 4;
+                    //float y = BitConverter.ToSingle(data, pos); pos += 4;
+                    //float z = BitConverter.ToSingle(data, pos); pos += 4;
+                    //float w = (float)Math.Sqrt(1.0f - (x * x + y * y + z * z));
+                    //values.Add(new FQuat(x, y, z, w));
+                }
+                break;
+            case AnimationCompressionFormat.ACF_Fixed48NoW:
+                for (int k = 0; k < numKeys; k++)
+                {
+                    var quat = reader.ReadQuatFixed48NoW(componentMask);
+                    values.Add(quat);
+                    pos += 4;
+                }
+                break;
+            case AnimationCompressionFormat.ACF_IntervalFixed32NoW:
+                for (int k = 0; k < numKeys; k++)
+                {
+                    //uint packed = BitConverter.ToUInt32(data, pos); pos += 4;
+                    //values.Add(new FQuat(x, y, z, w));
+                }
+                break;
+            case AnimationCompressionFormat.ACF_Fixed32NoW:
+                for (int k = 0; k < numKeys; k++)
+                {
+                    //values.Add(new FQuat(x, y, z, w));
+                }
+                break;
+        }
+
+        List<(float, FQuat)> result = new List<(float, FQuat)>(numKeys);
+        for (int k = 0; k < numKeys; k++)
+        {
+            result.Add((times[k], values[k]));
+        }
+        return result;
+    }
+
+    private static FVector GetInterpolatedTranslation(List<(float Time, FVector Value)> keys, float time, FVector defaultValue)
+    {
+        if (keys == null || keys.Count == 0) return defaultValue;
+        if (keys.Count == 1) return keys[0].Value;
+
+        int i = 0;
+        for (; i < keys.Count - 1; i++)
+        {
+            if (time < keys[i + 1].Time) break;
+        }
+        i = Math.Min(i, keys.Count - 2);
+
+        float alpha = (time - keys[i].Time) / (keys[i + 1].Time - keys[i].Time);
+        return keys[i].Value + alpha * (keys[i + 1].Value - keys[i].Value);
+    }
+
+    private static FQuat GetInterpolatedRotation(List<(float Time, FQuat Value)> keys, float time, FQuat defaultValue)
+    {
+        if (keys == null || keys.Count == 0) return defaultValue;
+        if (keys.Count == 1) return keys[0].Value;
+
+        int i = 0;
+        for (; i < keys.Count - 1; i++)
+        {
+            if (time < keys[i + 1].Time) break;
+        }
+        i = Math.Min(i, keys.Count - 2);
+
+        float alpha = (time - keys[i].Time) / (keys[i + 1].Time - keys[i].Time);
+        return FQuat.Slerp(keys[i].Value, keys[i + 1].Value, alpha);
+    }
+
+    private static void ProcessAnimationData(UAnimSequence animSequence, USkeleton skeleton, UsdSkelAnimation usdAnim, List<int> usedBoneIndices, UsdStage stage)
     {
         // アニメーションのフレーム数とレートを取得
         int numFrames = animSequence.NumFrames;
         float frameRate = animSequence.SequenceLength / (numFrames - 1); // 秒単位のフレーム間隔
+        float floatFps = 1f / frameRate;
+        int fps = (int)Math.Round(floatFps); // 30 FPSなど
+
         var timeCodes = new VtFloatArray((uint)numFrames);
         for (int f = 0; f < numFrames; f++)
         {
-            timeCodes[f] = f * frameRate; // timeSamplesのキーとして使用（秒単位）
+            timeCodes[f] = f + 1;  // フレーム番号を指定 1から（UsdTimeCodeのデフォルト単位）
         }
 
         int numBones = usedBoneIndices.Count;
@@ -145,6 +505,16 @@ public static class UAnimSequenceToUSD
             scalesPerFrame[f] = new VtVec3hArray((uint)numBones);
         }
 
+        // 1からnumFramesまでのtimeCodesを設定
+        stage.SetStartTimeCode(1);
+        stage.SetEndTimeCode(numFrames);
+
+        // timeCodesPerSecond
+        stage.SetTimeCodesPerSecond(fps);  // 30 FPSを設定
+        // framesPerSecond
+        stage.SetFramesPerSecond(fps);
+
+
         // UAnimSequenceからトラックデータを抽出
         var rawAnimData = animSequence.RawAnimationData;
         if (rawAnimData == null)
@@ -153,83 +523,171 @@ public static class UAnimSequenceToUSD
             {
                 case FUECompressedAnimData ueData:
                     {
-                        break;
-                        using var reader = new FByteArchive("CompressedByteStream", ueData.CompressedByteStream);
-                        var numSamples = numFrames;
-                        var numTracks = animSequence.GetNumTracks();
-                        var trackToSkeleton = animSequence.CompressedTrackToSkeletonMapTable;
-                        var atomKeys = new FTransform[numTracks * numSamples];
-                        var sequenceLength = animSequence.SequenceLength;
-
-                        // 1. 全トラックのキーフレームを解凍
-                        for (var trackIndex = 0; trackIndex < numTracks; trackIndex++)
+                        if (ueData.KeyEncodingFormat != AnimationKeyFormat.AKF_PerTrackCompression)
                         {
-                            int transOffset = ueData.CompressedTrackOffsets[trackIndex * 2];
-                            int rotOffset = ueData.CompressedTrackOffsets[trackIndex * 2 + 1];
-                            int scaleOffset =-1;
-                            if (ueData.CompressedScaleOffsets.OffsetData.Length > 0)
-                            {
-                                scaleOffset = ueData.CompressedScaleOffsets.GetOffsetData(trackIndex, -1);
-                            }
-
-                            var (transTimes, transKeys) = DecompressVectorTrack(reader, transOffset, numFrames, sequenceLength, isScale: false);
-                            var (rotTimes, rotKeys) = DecompressRotationTrack(reader, rotOffset, numFrames, sequenceLength);
-                            var (scaleTimes, scaleKeys) = DecompressVectorTrack(reader, scaleOffset, numFrames, sequenceLength, isScale: true);
-
-                            var outputOffset = trackIndex * numSamples;
-
-                            // 2. 全フレームを補間
-                            for (int f = 0; f < numSamples; f++)
-                            {
-                                var time = (f == 0 || numFrames <= 1) ? 0.0f : (float)f / (numFrames - 1) * sequenceLength;
-
-                                var translation = InterpolateVector(transTimes, transKeys, time, FVector.ZeroVector);
-                                var rotation = InterpolateRotation(rotTimes, rotKeys, time);
-                                var scale = InterpolateVector(scaleTimes, scaleKeys, time, FVector.OneVector);
-
-                                atomKeys[outputOffset + f] = new FTransform(rotation, translation, scale);
-                            }
+                            throw new NotImplementedException("AnimationKeyFormat.");
                         }
 
-                        // --- ここから下は元のコードと同じ ---
-                        // Now, similar to ACL, assign to perFrame arrays
-                        for (var boneIndex = 0; boneIndex < numBones; boneIndex++)
+                        using var reader = new FByteArchive("CompressedByteStream", ueData.CompressedByteStream);
+                        
+                        // CompressedTrackOffsetsからトラック情報を取得
+                        var compressedTrackOffsets = ueData.CompressedTrackOffsets;
+                        var compressedByteStream = ueData.CompressedByteStream;
+                        var compressedScaleOffsets = ueData.CompressedScaleOffsets;
+
+                        // 各トラックのデータをキャッシュ
+                        var translationTracksCache = new Dictionary<int, List<(float Time, FVector Value)>>();
+                        var rotationTracksCache = new Dictionary<int, List<(float Time, FQuat Value)>>();
+                        var scaleTracksCache = new Dictionary<int, List<(float Time, FVector Value)>>();
+
+
+                        // 全トラックを事前に展開
+                        var numTracks = animSequence.GetNumTracks();
+                        for (int trackIndex = 0; trackIndex < numTracks; trackIndex++)
                         {
-                            var skeletonBoneIndex = usedBoneIndices[boneIndex];
-                            var trackIndex = animSequence.FindTrackForBoneIndex(skeletonBoneIndex);
-                            if (trackIndex >= 0)
+                            int boneIndex = animSequence.GetTrackBoneIndex(trackIndex);
+                            if (boneIndex < 0) continue;
+
+                            // Translationトラックの展開
+                            var transOffset = trackIndex * 2;
+                            if (transOffset < compressedTrackOffsets.Length &&
+                                compressedTrackOffsets[transOffset] != -1)
                             {
-                                var offset = trackIndex * numSamples;
-                                for (int f = 0; f < Math.Min(numSamples, numFrames); f++)
+                                int offsetIndex = compressedTrackOffsets[transOffset];
+                                if (offsetIndex >= 0 && offsetIndex < compressedByteStream.Count())
                                 {
-                                    var transform = atomKeys[offset + f];
-                                    var translation = transform.Translation * USkeletalMeshToUSD.UeToUsdScale;
-                                    var usdPos = UsdCoordinateTransformer.TransformPosition(translation);
-                                    var usdRot = UsdCoordinateTransformer.TransformRotation(transform.Rotation);
+                                    var trackData = compressedByteStream[offsetIndex..].ToList<byte>();
+                                    try
+                                    {
+                                        var translationKeys = DecompressTranslationTrack(
+                                            trackData,
+                                            animSequence.SequenceLength,
+                                            numFrames);
 
-                                    translationsPerFrame[f][boneIndex] = new GfVec3f(usdPos.X, usdPos.Y, usdPos.Z);
-                                    rotationsPerFrame[f][boneIndex] = new GfQuatf(usdRot.W, usdRot.X, usdRot.Y, usdRot.Z);
-
-                                    var gfVec3F = new GfVec3f(transform.Scale3D.X, transform.Scale3D.Y, transform.Scale3D.Z);
-                                    scalesPerFrame[f][boneIndex] = new GfVec3h(gfVec3F);
+                                        if (translationKeys != null && translationKeys.Count > 0)
+                                        {
+                                            translationTracksCache[boneIndex] = translationKeys;
+                                        }
+                                    }
+                                    catch (Exception ex)
+                                    {
+                                        Console.WriteLine($"Warning: Failed to decompress translation track {transOffset} for bone {boneIndex}: {ex.Message}");
+                                    }
                                 }
                             }
-                            else
+
+                            // Rotationトラックの展開
+                            int rotationOffset = trackIndex * 2 + 1;
+                            if (rotationOffset < compressedTrackOffsets.Length &&
+                                compressedTrackOffsets[rotationOffset] != -1)
                             {
-                                // Use reference pose for bones without animation tracks
-                                var refPose = skeleton.ReferenceSkeleton.FinalRefBonePose[usedBoneIndices[boneIndex]];
-                                var translation = refPose.Translation * USkeletalMeshToUSD.UeToUsdScale;
-                                var usdPos = UsdCoordinateTransformer.TransformPosition(translation);
-                                var usdRot = UsdCoordinateTransformer.TransformRotation(refPose.Rotation);
+                                int offsetIndex = compressedTrackOffsets[rotationOffset];
+                                // Positionを設定
+                                reader.Position = offsetIndex;
 
-                                for (int f = 0; f < numFrames; f++)
+                                if (offsetIndex >= 0 && offsetIndex < compressedByteStream.Count())
                                 {
-                                    translationsPerFrame[f][boneIndex] = new GfVec3f(usdPos.X, usdPos.Y, usdPos.Z);
-                                    rotationsPerFrame[f][boneIndex] = new GfQuatf(usdRot.W, usdRot.X, usdRot.Y, usdRot.Z);
+                                    try
+                                    {
+                                        var rotationKeys = DecompressRotationTrack(
+                                            reader,
+                                            offsetIndex,
+                                            animSequence.SequenceLength,
+                                            numFrames);
 
-                                    var gfVec3F = new GfVec3f(refPose.Scale3D.X, refPose.Scale3D.Y, refPose.Scale3D.Z);
-                                    scalesPerFrame[f][boneIndex] = new GfVec3h(gfVec3F);
+                                        if (rotationKeys != null && rotationKeys.Count > 0)
+                                        {
+                                            rotationTracksCache[boneIndex] = rotationKeys;
+                                        }
+                                    }
+                                    catch (Exception ex)
+                                    {
+                                        Console.WriteLine($"Warning: Failed to decompress rotation track {trackIndex} for bone {boneIndex}: {ex.Message}");
+                                    }
                                 }
+                            }
+
+                            // Scaleトラックの展開（存在する場合）
+                            if (compressedScaleOffsets != null &&
+                                trackIndex < compressedScaleOffsets.OffsetData.Length)
+                            {
+                                int scaleOffsetIndex = compressedScaleOffsets.OffsetData[trackIndex];
+                                if (scaleOffsetIndex != -1 &&
+                                    scaleOffsetIndex >= 0 &&
+                                    scaleOffsetIndex < compressedByteStream.Count())
+                                {
+                                    var trackData = compressedByteStream[scaleOffsetIndex..].ToList<byte>();
+                                    try
+                                    {
+                                        var scaleKeys = DecompressTranslationTrack(
+                                            trackData,
+                                            animSequence.SequenceLength,
+                                            numFrames);
+
+                                        if (scaleKeys != null && scaleKeys.Count > 0)
+                                        {
+                                            scaleTracksCache[boneIndex] = scaleKeys;
+                                        }
+                                    }
+                                    catch (Exception ex)
+                                    {
+                                        Console.WriteLine($"Warning: Failed to decompress scale track {trackIndex} for bone {boneIndex}: {ex.Message}");
+                                    }
+                                }
+                            }
+                        }
+                        
+
+                        // 各ボーンの各フレームのトランスフォームを計算
+                        for (var boneIdx = 0; boneIdx < numBones; boneIdx++)
+                        {
+                            var boneIndex = usedBoneIndices[boneIdx];
+                            var refPose = skeleton.ReferenceSkeleton.FinalRefBonePose[boneIndex];
+
+                            // デフォルト値（リファレンスポーズ）
+                            FVector defaultTranslation = refPose.Translation;
+                            FQuat defaultRotation = refPose.Rotation;
+                            FVector defaultScale = refPose.Scale3D;
+
+                            // このボーンのトラックデータを取得
+                            translationTracksCache.TryGetValue(boneIndex, out var translationKeys);
+                            rotationTracksCache.TryGetValue(boneIndex, out var rotationKeys);
+                            scaleTracksCache.TryGetValue(boneIndex, out var scaleKeys);
+
+                            // 各フレームで補間
+                            for (int f = 0; f < numFrames; f++)
+                            {
+                                float time = f * frameRate;
+
+                                // Translation
+                                FVector translation = GetInterpolatedTranslation(
+                                    translationKeys,
+                                    time,
+                                    defaultTranslation);
+
+                                // Rotation
+                                FQuat rotation = GetInterpolatedRotation(
+                                    rotationKeys,
+                                    time,
+                                    defaultRotation);
+
+                                // Scale
+                                FVector scale = GetInterpolatedTranslation(
+                                    scaleKeys,
+                                    time,
+                                    defaultScale);
+
+                                // UE座標系からUSD座標系に変換
+                                var scaledTranslation = translation * USkeletalMeshToUSD.UeToUsdScale;
+                                var usdPos = UsdCoordinateTransformer.TransformPosition(scaledTranslation);
+                                var usdRot = UsdCoordinateTransformer.TransformRotation(rotation);
+
+                                // USDデータに設定
+                                translationsPerFrame[f][boneIdx] = new GfVec3f(usdPos.X, usdPos.Y, usdPos.Z);
+                                rotationsPerFrame[f][boneIdx] = new GfQuatf(usdRot.W, usdRot.X, usdRot.Y, usdRot.Z);
+
+                                var gfVec3F = new GfVec3f(scale.X, scale.Y, scale.Z);
+                                scalesPerFrame[f][boneIdx] = new GfVec3h(gfVec3F);
                             }
                         }
 
@@ -241,6 +699,17 @@ public static class UAnimSequenceToUSD
                         var tracksHeader = tracks.GetTracksHeader();
                         var numSamples = (int)tracksHeader.NumSamples;
 
+                        // ここでフレームレートを設定（tracksHeader.SampleRateを使用）
+                        // timeCodesPerSecond
+                        //stage.SetTimeCodesPerSecond(tracksHeader.SampleRate);  // 30 FPSを設定
+                        // framesPerSecond
+                        //stage.SetFramesPerSecond(tracksHeader.SampleRate);
+
+                        // 1からnumSamplesまでのtimeCodesを設定
+                        //stage.SetStartTimeCode(1);
+                        //stage.SetEndTimeCode(numSamples);
+
+                        // スケールを1に設定
                         tracks.SetDefaultScale(1);
 
                         var atomKeys = new FTransform[tracksHeader.NumTracks * numSamples];
@@ -302,7 +771,10 @@ public static class UAnimSequenceToUSD
             }
 
         }
-
+        else
+        {
+            throw new NotImplementedException("RawAnimationData is not supported in this implementation.");
+        }
         // 各ボーン（usedBoneIndices順）ごとにトラックを処理
 
         // timeSamplesを設定
@@ -312,255 +784,14 @@ public static class UAnimSequenceToUSD
 
         for (int f = 0; f < numFrames; f++)
         {
-            double time = timeCodes[f];
+            double time = timeCodes[f]; // フレーム番号をそのまま使用（1から始まる）
             translationsAttr.Set(translationsPerFrame[f], new UsdTimeCode(time));
             rotationsAttr.Set(rotationsPerFrame[f], new UsdTimeCode(time));
             scalesAttr.Set(scalesPerFrame[f], new UsdTimeCode(time));
         }
 
-        // frameRateを設定（metadata）
-        //var dict = new VtDictionary();
-        //dict.insert("frameRate", new VtValue(animSequence.RateScale));
-        //usdAnim.GetPrim().SetMetadata(new TfToken("customData"), dict);
     }
 
-    // --- 以下, ヘルパーメソッド群をクラス内に追加 ---
 
-    // CUE4ParseにはFVectorやFQuatのLerp/Slerpがない場合を想定した簡易的な実装
-    private static FVector Lerp(FVector a, FVector b, float t) => a + (b - a) * t;
-    private static FQuat Slerp(FQuat a, FQuat b, float t)
-    {
-        // CUE4ParseのFQuatにSlerpがない場合の簡易実装
-        // 実際にはドット product をチェックするなど、より堅牢な実装が必要
-        var result = a * (1.0f - t) + b * t;
-        result.Normalize();
-        return result;
-    }
-
-    // キーフレームリストから指定時間における値を補間して取得
-    private static FVector InterpolateVector(List<float> times, List<FVector> keys, float time, FVector defaultValue)
-    {
-        if (keys == null || keys.Count == 0) return defaultValue;
-        if (keys.Count == 1) return keys[0];
-
-        // 補間すべきキーフレームの区間を探す
-        int index1 = times.FindLastIndex(t => t <= time);
-        if (index1 < 0) index1 = 0;
-        int index2 = Math.Min(index1 + 1, keys.Count - 1);
-
-        if (index1 == index2) return keys[index1];
-
-        // 2つのキーフレーム間で線形補間
-        float time1 = times[index1];
-        float time2 = times[index2];
-        float alpha = (time - time1) / (time2 - time1);
-
-        return Lerp(keys[index1], keys[index2], alpha);
-    }
-
-    private static FQuat InterpolateRotation(List<float> times, List<FQuat> keys, float time)
-    {
-        if (keys == null || keys.Count == 0) return FQuat.Identity;
-        if (keys.Count == 1) return keys[0];
-
-        int index1 = times.FindLastIndex(t => t <= time);
-        if (index1 < 0) index1 = 0;
-        int index2 = Math.Min(index1 + 1, keys.Count - 1);
-
-        if (index1 == index2) return keys[index1];
-
-        float time1 = times[index1];
-        float time2 = times[index2];
-        float alpha = (time - time1) / (time2 - time1);
-
-        return Slerp(keys[index1], keys[index2], alpha);
-    }
-
-    // 位置(Vector)またはスケール(Vector)トラックを解凍する
-    private static (List<float> KeyTimes, List<FVector> KeyValues) DecompressVectorTrack(FByteArchive reader, int offset, int numFrames, float sequenceLength, bool isScale = false)
-    {
-        if (offset == -1) return (null, null);
-
-        reader.Seek(offset, SeekOrigin.Begin);
-        var packedInfo = reader.Read<uint>();
-        var numKeys = (int)(packedInfo & 0x00FFFFFFu);
-        var keyFormat = (AnimationCompressionFormat)(packedInfo >> 24);
-
-        if (numKeys == 0) return (null, null);
-
-        var keyValues = new List<FVector>(numKeys);
-
-        switch (keyFormat)
-        {
-            case AnimationCompressionFormat.ACF_None:
-            case AnimationCompressionFormat.ACF_Float96NoW:
-                for (int i = 0; i < numKeys; i++) keyValues.Add(reader.Read<FVector>());
-                break;
-            case AnimationCompressionFormat.ACF_Fixed48NoW:
-                for (int i = 0; i < numKeys; i++)
-                {
-                    ushort x = reader.Read<ushort>();
-                    ushort y = reader.Read<ushort>();
-                    ushort z = reader.Read<ushort>();
-                    int A = (x & 0x7FF) - 1024;
-                    int B = (y & 0x7FF) - 1024;
-                    int C = (z & 0x7FF) - 1024;
-                    float invLen = 1f / 2048f;
-                    keyValues.Add(new FVector(A * invLen, B * invLen, C * invLen));
-                }
-                break;
-            case AnimationCompressionFormat.ACF_IntervalFixed32NoW:
-                var mins = reader.Read<FVector>();
-                var ranges = reader.Read<FVector>();
-                for (int i = 0; i < numKeys; i++)
-                {
-                    uint packed = reader.Read<uint>();
-                    float x = ((packed & 0x3FF) / 1023f) * ranges.X + mins.X;
-                    float y = (((packed >> 10) & 0x3FF) / 1023f) * ranges.Y + mins.Y;
-                    float z = (((packed >> 20) & 0x3FF) / 1023f) * ranges.Z + mins.Z;
-                    keyValues.Add(new FVector(x, y, z));
-                }
-                break;
-            case AnimationCompressionFormat.ACF_Identity:
-                keyValues.Add(isScale ? FVector.OneVector : FVector.ZeroVector);
-                break;
-            case (AnimationCompressionFormat)17:
-            case (AnimationCompressionFormat)18:
-            case (AnimationCompressionFormat)19:
-            case (AnimationCompressionFormat)21:
-            case (AnimationCompressionFormat)23:
-            case (AnimationCompressionFormat)35:
-            case (AnimationCompressionFormat)39:
-            case (AnimationCompressionFormat)55:
-                // Assuming this is a half-float format (3 * 16 bits = 48 bits)
-                for (int i = 0; i < numKeys; i++)
-                {
-                    Half x = reader.Read<Half>();
-                    Half y = reader.Read<Half>();
-                    Half z = reader.Read<Half>();
-                    keyValues.Add(new FVector((float)x, (float)y, (float)z));
-                }
-                break;
-            default:
-                for (int i = 0; i < numKeys; i++)
-                {
-                    Half x = reader.Read<Half>();
-                    Half y = reader.Read<Half>();
-                    Half z = reader.Read<Half>();
-                    keyValues.Add(new FVector((float)x, (float)y, (float)z));
-                } 
-                break;
-                //throw new NotImplementedException($"Unsupported vector format {keyFormat}");
-        }
-
-        var keyTimes = new List<float>(numKeys);
-        for (int i = 0; i < numKeys; i++)
-        {
-            keyTimes.Add((numKeys <= 1) ? 0.0f : (float)i / (numKeys - 1) * sequenceLength);
-        }
-
-        return (keyTimes, keyValues);
-    }
-
-    // 回転(Quaternion)トラックを解凍する
-    private static (List<float> KeyTimes, List<FQuat> KeyValues) DecompressRotationTrack(FByteArchive reader, int offset, int numFrames, float sequenceLength)
-    {
-        if (offset == -1) return (null, null);
-
-        reader.Seek(offset, SeekOrigin.Begin);
-        var packedInfo = reader.Read<uint>();
-        var numKeys = (int)(packedInfo & 0x00FFFFFFu);
-        var keyFormat = (AnimationCompressionFormat)(packedInfo >> 24);
-
-        if (numKeys == 0) return (null, null);
-
-        var keyValues = new List<FQuat>(numKeys);
-
-        switch (keyFormat)
-        {
-            case AnimationCompressionFormat.ACF_None:
-                for (int i = 0; i < numKeys; i++) keyValues.Add(reader.Read<FQuat>());
-                break;
-            case AnimationCompressionFormat.ACF_Float96NoW:
-                for (int i = 0; i < numKeys; i++)
-                {
-                    FVector v = reader.Read<FVector>();
-                    float wSq = Math.Max(1f - (v.X * v.X + v.Y * v.Y + v.Z * v.Z), 0f);
-                    float w = (float)Math.Sqrt(wSq);
-                    keyValues.Add(new FQuat(v.X, v.Y, v.Z, w));
-                }
-                break;
-            case AnimationCompressionFormat.ACF_Fixed48NoW:
-                for (int i = 0; i < numKeys; i++)
-                {
-                    ushort M = reader.Read<ushort>();
-                    ushort N = reader.Read<ushort>();
-                    ushort O = reader.Read<ushort>();
-                    int A = (M & 0x7FF) - 1024;
-                    int B = (N & 0x7FF) - 1024;
-                    int C = (O & 0x7FF) - 1024;
-                    float sumSquare = A * A + B * B + C * C;
-                    float wSq = Math.Max(2048 * 2048 - sumSquare, 0f);
-                    float w = (float)Math.Sqrt(wSq);
-                    if ((M & 0x8000) != 0 || (N & 0x8000) != 0 || (O & 0x8000) != 0) w = -w;
-                    float invLen = 1f / 2048f;
-                    var quat = new FQuat(A * invLen, B * invLen, C * invLen, w * invLen);
-                    quat.Normalize();
-                    keyValues.Add(quat);
-                }
-                break;
-            case AnimationCompressionFormat.ACF_IntervalFixed32NoW:
-                var mins = reader.Read<FVector>();
-                var ranges = reader.Read<FVector>();
-                for (int i = 0; i < numKeys; i++)
-                {
-                    uint packed = reader.Read<uint>();
-                    float x = ((packed & 0x3FF) / 1023f) * ranges.X + mins.X;
-                    float y = (((packed >> 10) & 0x3FF) / 1023f) * ranges.Y + mins.Y;
-                    float z = (((packed >> 20) & 0x3FF) / 1023f) * ranges.Z + mins.Z;
-                    float wSq = 1f - (x * x + y * y + z * z);
-                    float w = (wSq > 0f) ? (float)Math.Sqrt(wSq) : 0f;
-                    var quat = new FQuat(x, y, z, w);
-                    quat.Normalize();
-                    keyValues.Add(quat);
-                }
-                break;
-            case AnimationCompressionFormat.ACF_Identity:
-                keyValues.Add(FQuat.Identity);
-                break;
-            case (AnimationCompressionFormat)23:
-            case (AnimationCompressionFormat)31:
-            case (AnimationCompressionFormat)34:
-            case (AnimationCompressionFormat)36:
-            case (AnimationCompressionFormat)38:
-            case (AnimationCompressionFormat)39:
-            case (AnimationCompressionFormat)47:
-                // Assuming half-float format similar to ACF_Float96NoW
-                for (int i = 0; i < numKeys; i++)
-                {
-                    Half hx = reader.Read<Half>();
-                    Half hy = reader.Read<Half>();
-                    Half hz = reader.Read<Half>();
-                    float x = (float)hx;
-                    float y = (float)hy;
-                    float z = (float)hz;
-                    float wSq = Math.Max(1f - (x * x + y * y + z * z), 0f);
-                    float w = (float)Math.Sqrt(wSq);
-                    var quat = new FQuat(x, y, z, w);
-                    quat.Normalize();
-                    keyValues.Add(quat);
-                }
-                break;
-            default:
-                throw new NotImplementedException($"Unsupported rotation format {keyFormat}");
-        }
-
-        var keyTimes = new List<float>(numKeys);
-        for (int i = 0; i < numKeys; i++)
-        {
-            keyTimes.Add((numKeys <= 1) ? 0.0f : (float)i / (numKeys - 1) * sequenceLength);
-        }
-
-        return (keyTimes, keyValues);
-    }
+    
 }
