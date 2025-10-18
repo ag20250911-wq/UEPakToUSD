@@ -67,12 +67,12 @@ internal class Program
     {
         // 1. ゲームのインストールフォルダとUE Version を指定して、プロバイダーを初期化する
         // C:\Program Files (x86)\Steam\steamapps\common\MGSDelta\MGSDelta\Content\Paks
-        //var provider = new DefaultFileProvider(@"H:\Paks\mgs3", SearchOption.AllDirectories, true, new VersionContainer(EGame.GAME_UE5_3));
-        var provider = new DefaultFileProvider(@"H:\Paks\ue5.3", SearchOption.AllDirectories, true, new VersionContainer(EGame.GAME_UE5_3));
+        var provider = new DefaultFileProvider(@"H:\Paks\mgs3", SearchOption.AllDirectories, true, new VersionContainer(EGame.GAME_UE5_3));
+        //var provider = new DefaultFileProvider(@"H:\Paks\ue5.3", SearchOption.AllDirectories, true, new VersionContainer(EGame.GAME_UE5_3));
 
         // 2. MappingFileを設定
-        //provider.MappingsContainer = new FileUsmapTypeMappingsProvider("H:\\Paks\\mgs3\\5.3.2-1582552+++rg5+rel_1.1.1-MGSDelta.usmap");
-        provider.MappingsContainer = new FileUsmapTypeMappingsProvider("H:\\Paks\\ue5.3\\Mappings.usmap");
+        provider.MappingsContainer = new FileUsmapTypeMappingsProvider("H:\\Paks\\mgs3\\5.3.2-1582552+++rg5+rel_1.1.1-MGSDelta.usmap");
+        //provider.MappingsContainer = new FileUsmapTypeMappingsProvider("H:\\Paks\\ue5.3\\Mappings.usmap");
 
         // 3. プロバイダーを初期化して、.pak ファイルを読み込ませる
         provider.Initialize();
@@ -128,6 +128,7 @@ internal class Program
 
                     if (export is USkeletalMesh obj33)
                     {
+                        continue;
                         isanim = true;
 
                         obj33.Skeleton.TryLoad(out USkeleton skeleton00);
