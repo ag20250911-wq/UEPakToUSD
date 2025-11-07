@@ -67,6 +67,7 @@ internal class Program
     {
         // 1. ゲームのインストールフォルダとUE Version を指定して、プロバイダーを初期化する
         // C:\Program Files (x86)\Steam\steamapps\common\MGSDelta\MGSDelta\Content\Paks
+        //var provider = new DefaultFileProvider(@"H:\Paks\mgs3fh", SearchOption.AllDirectories, true, new VersionContainer(EGame.GAME_UE5_3));
         var provider = new DefaultFileProvider(@"H:\Paks\mgs3", SearchOption.AllDirectories, true, new VersionContainer(EGame.GAME_UE5_3));
         //var provider = new DefaultFileProvider(@"H:\Paks\ue5.3", SearchOption.AllDirectories, true, new VersionContainer(EGame.GAME_UE5_3));
 
@@ -121,15 +122,24 @@ internal class Program
             using (pkg as IDisposable) // 明示的破棄
             {
                 bool isanim = false;
-                foreach (var export in pkg.GetExports())
+                var pkgs = pkg.GetExports();
+                int i = 0;
+
+                foreach (var export in pkgs)
                 {
+                    i++;
+                    if (i > pkgs.Count())
+                    {
+                        break;
+                    }
+
                     var t = export.GetType();
                     var tc = t.Name;
 
                     if (export is USkeletalMesh obj33)
                     {
                         continue;
-                        isanim = true;
+                        //isanim = true;
 
                         obj33.Skeleton.TryLoad(out USkeleton skeleton00);
 
@@ -174,6 +184,34 @@ internal class Program
 
                     if (export is UAnimSequence uAnimSequence)
                     {
+                        //continue;
+                        if (uAnimSequence.Name == "Msa_msa_dam_tree_015")
+                        {
+                            //continue;
+                        }
+                        if (uAnimSequence.Name == "Msa_msa_idle2turn_l__lp_008")
+                        {
+                            //continue;
+                        }
+                        if (uAnimSequence.Name == "Grd_Dog_dog_smell_stand_030")
+                        {
+                            //continue;
+                        }
+                        if (uAnimSequence.Name == "Grd_Dog_dog_growl_001")
+                        {
+                            //continue;
+                        }
+                        if (uAnimSequence.Name == "Wp_Litt_mt_little_idle_000")
+                        {
+                            //continue;
+                        }
+                        if (uAnimSequence.Name == "Wp_Litt_mt_little_t_end_006")
+                        {
+                            //continue;
+                        }
+
+                        Console.WriteLine("AnimSequence:" + uAnimSequence.Name);
+
                         // ボーン数
                         var bones = uAnimSequence.GetNumTracks();
 
@@ -193,8 +231,15 @@ internal class Program
                             }
                             */
 
-                            // アニメーションをUSDに変換（optimizeBonesをfalseに設定、またはアニメーション用に調整）
-                            UAnimSequenceToUSD.ConvertAnimationToUsd(uAnimSequence, skeleton, dir + "\\", false);
+                            try
+                            {
+                                // アニメーションをUSDに変換（optimizeBonesをfalseに設定、またはアニメーション用に調整）
+                                UAnimSequenceToUSD.ConvertAnimationToUsd(uAnimSequence, skeleton, dir + "\\");
+                            }
+                            catch (Exception)
+                            {
+                                File.AppendAllText(dir + "\\err.txt", uAnimSequence.Name + "\n");
+                            }
 
                         }
                         //isanim = true;
